@@ -7,6 +7,17 @@ the same `config.json`, works as a `docker --runtime=` backend.
 The goal is a minimal, readable implementation that focuses on the
 syscall-floor cost of the OCI lifecycle.
 
+## Performance
+
+On a `create + start + delete` lifecycle (`hyperfine` against an OCI
+bundle running `/bin/true`, drop_caches between runs), rsrun is about
+**1.4× faster than crun**, **2.9× faster than youki**, and **16× faster
+than runc**. Max RSS (`/usr/bin/time -v`) is about 2.1 MB (vs 3.4 MB
+for crun, 11.7 MB for runc).
+
+Full numbers, methodology, and platform:
+[docs/benchmarks.md](docs/benchmarks.md).
+
 ## Status
 
 Early. Linux-only. No releases yet — build from source.
@@ -74,6 +85,8 @@ docker run --rm --runtime=rsrun alpine echo hello
 
 - [docs/architecture.md](docs/architecture.md) — process model, the
   child code path, the `CompiledPlan` idea
+- [docs/benchmarks.md](docs/benchmarks.md) — full performance and
+  memory-footprint numbers
 - [docs/oci-compliance.md](docs/oci-compliance.md) — what the
   `runtime-tools` validation suite says
 - [docs/docker.md](docs/docker.md) — using rsrun as a Docker runtime

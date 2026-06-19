@@ -6,3 +6,5 @@ Cargo.lock.bak
 *.swo
 .idea/
 .vscode/
+
+.env
