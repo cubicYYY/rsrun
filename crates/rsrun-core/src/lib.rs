@@ -16,6 +16,13 @@ pub mod state;
 mod runtime;
 
 pub use runtime::{
-    cmd_create, cmd_create_full, cmd_create_with_ext, cmd_delete, cmd_exec, cmd_kill, cmd_list,
-    cmd_start, cmd_state,
+    cmd_create, cmd_create_full, cmd_create_with_ext, cmd_delete, cmd_exec, cmd_exec_full,
+    cmd_kill, cmd_list, cmd_start, cmd_state,
 };
+
+#[cfg(feature = "pause")]
+pub use runtime::{cmd_pause, cmd_resume};
+#[cfg(feature = "update")]
+pub use runtime::cmd_update;
+#[cfg(feature = "stats")]
+pub use runtime::{cmd_events, cmd_stats};

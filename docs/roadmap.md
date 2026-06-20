@@ -1,148 +1,146 @@
 # Roadmap
 
 rsrun's hot path is in `rsrun-core` (the lifecycle: clone3, namespaces,
-mounts, caps, exec). Heavier features that don't go in the daemon hot
-path live in `rsrun-ext`. Items below are roughly grouped by category;
-ordering inside each group is rough priority.
+mounts, caps, exec). Heavier features live in `rsrun-ext`, all gated
+as default-on Cargo features so the binary can be slimmed by opting
+out.
+
+For a comprehensive feature-by-feature comparison against crun, see
+[gaps-vs-crun.md](gaps-vs-crun.md). This file lists the priority order
+for what we'd implement next.
 
 ## Now in tree
 
 These don't affect the bench numbers because none of them touch the
 `create + start + delete` hot path of an empty bundle.
 
-- **seccomp** filter compilation and install
-  (`prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`). Backed by
-  [`seccompiler`] after a three-way bench against `libseccomp` and a
-  hand-rolled BPF emitter on the OCI default profile (462 syscalls).
-  Allowlist-by-name only; argument-based matching is on the roadmap.
-- **cgroup-v2 limits**: `memory.max`, `memory.swap.max`, `memory.low`,
-  `cpu.max`, `cpu.weight`, `cpuset.cpus`, `cpuset.mems`, `pids.max`,
-  per-device `io.max`. Honors `linux.resources` from `config.json`.
-- **`linux.namespaces[].path`** — joining a pre-existing namespace via
-  `setns(2)` instead of creating a fresh one. This is what lets
-  `rsrund` use a pre-warmed namespace pool. PID-ns join works for the
-  next forked task; callers that need the calling task itself in the
-  new pid-ns must re-fork (kernel limitation).
+### Lifecycle / verbs
+- Full `create` / `start` / `delete` / `state` / `kill` / `exec` /
+  `list` / `features` lifecycle.
+- `pause` / `resume` (cgroup-v2 `cgroup.freeze`).
+- `update` re-tunes cgroup-v2 limits on a running container.
+- `stats` / `events` stream cgroup-v2 metrics for `docker stats`.
+
+### Namespaces / mounts
+- All seven namespaces; rootful and rootless (single user namespace).
+- `linux.namespaces[].path` — joining a pre-existing namespace via
+  `setns(2)`. PID-ns join works (post-clone3 child re-forks once when
+  joining `pid`, mirroring crun).
+- `linux.rootfsPropagation` modes (shared / slave / private /
+  unbindable + `r*` recursive).
+- `linux.sysctl` writes inside the new namespaces.
+
+### Process / security
+- Capabilities (all five sets), rlimits, default `/dev`, masked +
+  readonly paths, `noNewPrivileges`, `process.user` uid/gid + supp gids.
+- **seccomp** profile compilation + install (via [`seccompiler`]).
+- **AppArmor / SELinux** profile staging via `/proc/self/attr/...`
+  for the next execve.
+- **`exec` with full OCI semantics**: honors `process.json`'s `user`,
+  `capabilities`, `noNewPrivileges`, `apparmorProfile`, `selinuxLabel`,
+  `terminal` + `--console-socket`. Order matches `child_run`
+  (groups → caps → user → NNP → LSM).
+
+### Resources
+- **cgroup-v2 limits**: `memory.{max,swap.max,low}`, `cpu.{max,weight}`,
+  `cpuset.{cpus,mems}`, `pids.max`, per-device `io.max`.
+- **Device cgroup BPF** (`linux.resources.devices`): hand-rolled eBPF
+  emitter compiles allow/deny rules to a `BPF_PROG_TYPE_CGROUP_DEVICE`
+  program. OCI defaults + `linux.devices` entries are implicitly
+  allowed. ~250 LOC, zero new crate deps.
+- **`--systemd-cgroup`** delegates cgroup creation to `systemd-run`
+  (transient `.scope` slice).
+
+### Engine integration
 - **OCI hooks**: all six phases. `prestart` / `createRuntime` /
   `poststart` / `poststop` fire from the parent; `createContainer` /
-  `startContainer` fire from inside the container's namespaces (after
-  pivot_root). Hooks are persisted to `<state-dir>/hooks.json` during
-  `create` so `start` and `delete` can read them.
-- **TTY / `console-socket`**: when `process.terminal: true` and the
-  engine passes `--console-socket`, rsrun allocates a PTY pair via
-  `openpty`, sends the master fd to the engine via SCM_RIGHTS, and
-  dup2's the slave onto the workload's stdin/stdout/stderr. Makes
-  `docker run -it` work end-to-end.
-- **AppArmor / SELinux** profile staging. `process.apparmorProfile`
-  is written as `"exec <profile>"` to `/proc/self/attr/apparmor/exec`
-  (with `/proc/self/attr/exec` as the legacy fallback);
-  `process.selinuxLabel` is written to `/proc/self/attr/exec`. The
-  kernel then transitions on the next execve. Same path libapparmor /
-  libselinux take.
-- **Full-fledged `exec`**. `process.json` is parsed for `user`
-  (`uid` / `gid` / `additionalGids`), `capabilities` (all five sets),
-  `noNewPrivileges`, `apparmorProfile`, `selinuxLabel`, and applied to
-  the exec child in the kernel-required order (groups → caps → user
-  transition → NNP → LSM staging) before `execve`. Mirrors the
-  create-time child path so semantics stay consistent.
+  `startContainer` fire from inside the container's namespaces.
+- **TTY / `console-socket`**: PTY pair + SCM_RIGHTS forward — makes
+  `docker run -it` and `docker exec -it` work end-to-end.
+- **Cargo features**: every optional capability gated; default = full
+  set, `--no-default-features` produces a 753 KB minimum binary.
 
-## Soon — production-impact gaps vs crun / youki
+## Soon — gaps that affect everyday users
 
-These are the missing pieces that affect everyday `docker run` /
-`podman run` invocations under realistic security profiles.
+In rough priority order. See
+[gaps-vs-crun.md](gaps-vs-crun.md) for full context and crun source
+references for each item.
 
-### Workload isolation
+1. **`--preserve-fds`** — pass extra fds into the container init.
+   Used by systemd socket-activation, podman socket injection, some
+   CDI plugins. Currently parsed-and-ignored. ~30 LOC.
 
-- **Device cgroup BPF** (`linux.resources.devices`). Hand-rolled eBPF
-  emitter (~200 LOC, zero new crate deps) compiles allow/deny rules
-  to a `BPF_PROG_TYPE_CGROUP_DEVICE` program and attaches it to the
-  cgroup-v2 directory via two `bpf(2)` syscalls. The OCI default
-  devices (/dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom,
-  /dev/tty) and entries from `linux.devices` are implicitly allowed —
-  required for the runtime's own mknod step to succeed under a
-  spec-default deny-all rule. First-match-wins, with a wildcard rule
-  short-circuiting later emission (matches crun's HAS_WILDCARD logic).
-- **Custom seccomp argument matching**. OCI seccomp's per-syscall
-  `args` field (compare argument values, not just syscall names).
-  Used for filters like "allow `clone()` only without `CLONE_NEWUSER`."
-- **Device cgroup BPF** (`linux.resources.devices`). Custom allow / deny
-  rules. Today rsrun parses but doesn't enforce; the default cgroup-v2
-  device posture is what's active. Need a
-  `BPF_PROG_TYPE_CGROUP_DEVICE` emitter.
+2. **`--no-pivot`** — skip pivot_root, use chroot. Required for
+   read-only rootfs and embedded images. ~20 LOC.
 
-### Resource control
+3. **`process.oomScoreAdj`** — write `/proc/self/oom_score_adj`.
+   Kubernetes sets this per pod QoS class; affects OOM-kill
+   priority under memory pressure. ~10 LOC.
 
-- **systemd cgroup driver**. Talk to systemd via D-Bus to create
-  transient `.scope` slices instead of writing cgroupfs directly.
-  Required when `--systemd-cgroup` is set (rsrun accepts the flag and
-  ignores it).
-- **cgroup v1**. End-of-life on systemd-cgroup hosts but still in use
-  on older fleets. Both crun and youki support v1 + v2.
-- **More cgroup knobs**: `cpu.idle`, `cpu.uclamp.*`, `memory.peak`,
-  `hugetlb.<size>.max`, `rdma.max`, `misc.max`. CPU
-  `realtime_runtime` / `realtime_period` for RT scheduling. Niche but
-  used.
-- **Intel RDT** (`linux.intelRdt`). Cache and memory-bandwidth
-  partitioning. crun and youki implement.
-- **Network classifier / priorities** (`linux.resources.network`).
+4. **Hook timeout enforcement** — kill hook subprocess after
+   `hooks[i].timeout` seconds. A misbehaving CDI hook currently hangs
+   `create` forever. ~15 LOC.
 
-### Lifecycle / management
+5. **`linux.sysctl` conflict validation** — reject conflicts with the
+   `hostname` field, namespace-required sysctls without the matching
+   namespace, etc. crun does this in the spec parser. ~30 LOC.
 
-- **`exec` with full OCI semantics**. Today rsrun's `exec` does bare
-  setns + fork + execvpe. Need to honor `--cwd`, `--user`, `--env`,
-  `--apparmor`, `--cap`, `--no-new-privs`, `-t/--tty` with console
-  socket, `--detach`. Required for proper `docker exec`.
-- **`pause` / `resume`**. Uses `freezer` cgroup (v1) or
-  `cgroup.freeze` (v2). Both crun and youki ship this.
-- **`update`**. Modify cgroup limits on a running container.
-- **`events`**, **`stats`**. Stream cgroup metrics. crun and youki
-  ship both.
-- **`spec` subcommand**. Generate a default `config.json`. Currently
-  returns "not implemented".
+6. **`process.consoleSize`** — `TIOCSWINSZ` after PTY allocation. PTY
+   currently inherits the kernel default rows × cols. ~10 LOC.
 
-### Spec fields parsed-but-ignored
+7. **`process.scheduler`** — `SCHED_FIFO` / `SCHED_RR` /
+   `SCHED_DEADLINE` via `sched_setattr(2)`. Realtime workloads,
+   K8s latency-sensitive pods. ~50 LOC.
 
-- **`linux.sysctl`**. Write each `key=value` into `/proc/sys/...`.
-- **`process.scheduler`** / **`linux.scheduler`**. `SCHED_FIFO`,
-  `SCHED_DEADLINE`, etc.
-- **`process.ioPriority`**. `ioprio_set(IOPRIO_WHO_PROCESS, ...)`.
-- **`process.consoleSize`**. Set the PTY initial size.
-- **`process.rlimits[].soft > hard` validation**. youki/crun reject
-  invalid pairs; rsrun accepts.
-- **`linux.timeOffsets` / time namespace** (`CLONE_NEWTIME`,
-  Linux 5.6+). rsrun doesn't even create the time namespace today.
+8. **`linux.mountLabel`** propagation — choose `context=` mount
+   option vs `setxattr(security.selinux)` per fstype. SELinux hosts
+   currently see denied access on bind-mounted volumes. ~40 LOC.
 
-### Mount features
+9. **Idmapped mounts** (`linux.mounts[].uidMappings` /
+   `gidMappings`, kernel 5.12+) — `mount_setattr(MOUNT_ATTR_IDMAP)`.
+   Used by Docker 25+ rootless remapping and the K8s user-namespace
+   feature gate. ~80 LOC + kernel-version detection.
 
-- **Mount propagation modes** (shared / slave / private / unbindable
-  + the `r*` recursive variants). Covered by 3 of the 319 cases in
-  `runtime-tools`'s `mounts.t` that rsrun doesn't pass.
-- **Idmapped mounts** (`linux.mounts[].uidMappings` /
-  `gidMappings`, Linux 5.12+). crun and youki implement.
-
-### Build / packaging
-
-- **Multi-arch**. `clone3` syscall number is hardcoded for arm64;
-  the seccomp x86_64 syscall table is empty. Both need filling in.
-- **Static musl build**. Currently the release binary links
-  dynamically against glibc.
-- **Distro packaging**. Debian/Ubuntu .deb, Fedora/RHEL .rpm, AUR.
+10. **cgroup v1** — RHEL 8, Amazon Linux 2, older Debian. ~600 LOC
+    duplicating cgroup-v2 logic for v1's per-controller layout.
+    Diminishing return.
 
 ## Later
 
-- **Per-container network setup** (CNI / built-in bridge). Today
-  rsrun sets the netns flag and leaves wiring to the engine.
-- **CRIU** checkpoint / restore (`checkpoint`, `restore` subcommands).
-- **WASM workloads**. youki has a mode that runs the workload via a
-  WebAssembly runtime instead of execve; out of scope for v0 but
-  noted for completeness.
-- **Annotations passthrough into hook env vars**. crun, runc, and
-  youki inject annotation key/value pairs into the environment of
-  hook subprocesses.
-- **Log levels / structured logging**. crun and youki support log
-  levels and structured fields; rsrun emits plain or JSON error-only.
+- **`spec` subcommand** — generate a default `config.json`. Currently
+  returns "not implemented".
+- **Custom seccomp argument matching** — OCI seccomp's per-syscall
+  `args` field. Used for filters like "allow `clone()` only without
+  `CLONE_NEWUSER`."
+- **AppArmor profile stacking** — `change_profile` (stacked) vs
+  `change_onexec`; for container-in-container scenarios.
+- **More cgroup-v2 knobs** — `cpu.idle`, `cpu.uclamp.*`,
+  `memory.peak`, `hugetlb.<size>.max`, `rdma.max`, `misc.max`.
+- **Intel RDT** (`linux.intelRdt`) — HPC / trading workloads.
+- **`linux.memoryPolicy`** — NUMA `MPOL_BIND` / `MPOL_INTERLEAVE`.
+- **`linux.personality`** — 32-bit ABI emulation.
+- **`process.ioPriority`** — `ioprio_set(2)`.
+- **`linux.timeOffsets` / time namespace** (`CLONE_NEWTIME`).
+- **CRIU** checkpoint / restore.
+- **WASM workloads** — youki has it; out of scope for now.
+- **Annotations passthrough** into hook env vars.
+- **Log levels / structured logging** — rsrun emits plain or JSON
+  error-only.
+- **Per-container network setup** (CNI / built-in bridge) — engine
+  territory; rsrun sets the netns flag and stops there.
+
+## Build / packaging
+
+- **Multi-arch**: `clone3` syscall number hardcoded for arm64; the
+  seccomp x86_64 syscall table is not populated. Need to switch on
+  `target_arch`.
+- **Static musl build**: release binary links dynamically against
+  glibc.
+- **Distro packaging**: Debian/Ubuntu .deb, Fedora/RHEL .rpm, AUR.
 
 ## Possible directions (perf-focused)
+
+These are speculative. None are blocked on a missing OCI feature.
 
 - **`mimalloc` as global allocator.** Slight startup improvement.
 - **`pidfd`-based wait** in `delete` (avoid `/proc/<pid>` polling).

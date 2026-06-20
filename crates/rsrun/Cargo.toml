@@ -14,10 +14,38 @@ categories = ["virtualization", "command-line-utilities"]
 name = "rsrun"
 path = "src/main.rs"
 
+[features]
+# Feature names mirror rsrun-ext / rsrun-core's. Users who want a
+# minimal binary can build with --no-default-features and select.
+default = [
+    # rsrun-ext features
+    "seccomp",
+    "cgroup-limits",
+    "hooks",
+    "device-cgroup-bpf",
+    # rsrun-core features
+    "pause",
+    "update",
+    "stats",
+    "sysctl",
+    "lsm",
+    "systemd-cgroup",
+]
+seccomp = ["rsrun-ext/seccomp"]
+cgroup-limits = ["rsrun-ext/cgroup-limits"]
+hooks = ["rsrun-ext/hooks"]
+device-cgroup-bpf = ["rsrun-ext/device-cgroup-bpf"]
+pause = ["rsrun-core/pause"]
+update = ["rsrun-core/update"]
+stats = ["rsrun-core/stats"]
+sysctl = ["rsrun-core/sysctl"]
+lsm = ["rsrun-core/lsm"]
+systemd-cgroup = ["rsrun-core/systemd-cgroup"]
+
 [dependencies]
 nix.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 clap.workspace = true
-rsrun-core = { path = "../rsrun-core" }
-rsrun-ext = { path = "../rsrun-ext" }
+rsrun-core = { path = "../rsrun-core", default-features = false }
+rsrun-ext = { path = "../rsrun-ext", default-features = false }

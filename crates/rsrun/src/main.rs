@@ -87,7 +87,7 @@ enum Cmd {
         #[arg(short, long)]
         _tty: bool,
         #[arg(long = "console-socket")]
-        _console_socket: Option<String>,
+        console_socket: Option<PathBuf>,
         #[arg(long = "pidfd-socket")]
         _pidfd_socket: Option<String>,
         #[arg(short, long)]
@@ -114,6 +114,32 @@ enum Cmd {
     List,
     /// Not implemented.
     Spec,
+    /// Freeze a running container's processes (cgroup-v2 cgroup.freeze).
+    #[cfg(feature = "pause")]
+    Pause { id: String },
+    /// Unfreeze a paused container.
+    #[cfg(feature = "pause")]
+    Resume { id: String },
+    /// Re-write the cgroup-v2 resource limits of a running container.
+    #[cfg(feature = "update")]
+    Update {
+        /// Path to a JSON file with the OCI `linux.resources` shape;
+        /// reads stdin if absent.
+        #[arg(short, long, alias = "resources")]
+        resources: Option<PathBuf>,
+        id: String,
+    },
+    /// Print one JSON line of cgroup-v2 metrics for a running container.
+    #[cfg(feature = "stats")]
+    Stats { id: String },
+    /// Stream cgroup-v2 metrics every second (or one shot with --stats).
+    #[cfg(feature = "stats")]
+    Events {
+        /// Print one snapshot and exit.
+        #[arg(long)]
+        stats: bool,
+        id: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -124,6 +150,9 @@ fn main() -> ExitCode {
     }
     if cli.log_format.as_deref() == Some("json") {
         std::env::set_var("RSRUN_LOG_FORMAT_JSON", "1");
+    }
+    if cli.systemd_cgroup {
+        std::env::set_var("RSRUN_SYSTEMD_CGROUP", "1");
     }
 
     // If --log was given, redirect stderr to it. containerd reads this
@@ -152,12 +181,22 @@ fn main() -> ExitCode {
         Cmd::Delete { force, id } => runtime::cmd_delete(&id, force),
         Cmd::State { id } => runtime::cmd_state(&id),
         Cmd::Kill { id, signal } => runtime::cmd_kill(&id, &signal),
-        Cmd::Exec { process, pid_file, detach, id, .. } => {
-            runtime::cmd_exec(&id, &process, pid_file.as_deref(), detach)
+        Cmd::Exec { process, pid_file, detach, id, console_socket, .. } => {
+            runtime::cmd_exec_full(&id, &process, pid_file.as_deref(), detach, console_socket.as_deref())
         }
         Cmd::Features => sub_features(),
         Cmd::List => runtime::cmd_list(),
         Cmd::Spec => Err(std::io::Error::other("spec subcommand not implemented")),
+        #[cfg(feature = "pause")]
+        Cmd::Pause { id } => runtime::cmd_pause(&id),
+        #[cfg(feature = "pause")]
+        Cmd::Resume { id } => runtime::cmd_resume(&id),
+        #[cfg(feature = "update")]
+        Cmd::Update { resources, id } => runtime::cmd_update(&id, resources.as_deref()),
+        #[cfg(feature = "stats")]
+        Cmd::Stats { id } => runtime::cmd_stats(&id),
+        #[cfg(feature = "stats")]
+        Cmd::Events { stats, id } => runtime::cmd_events(&id, stats),
     };
 
     match res {

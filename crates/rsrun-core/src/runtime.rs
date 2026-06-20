@@ -200,6 +200,16 @@ pub fn cmd_create_full(
     // and stash the path for post-clone3 child-PID write. Empty if ext
     // produced no resource constraints (or rsrund called via cmd_create).
     if let Some(cgroup_dir) = plan.ext.cgroup_v2_path.as_deref() {
+        // When --systemd-cgroup was passed, ask systemd to create a
+        // transient .scope slice for the container. Falls back to
+        // direct cgroupfs if systemd-run isn't available or fails.
+        // Best-effort: if the slice already exists or creation
+        // succeeded, we proceed; on failure we still mkdir the path
+        // ourselves so the rest of the pipeline works.
+        #[cfg(feature = "systemd-cgroup")]
+        if std::env::var_os("RSRUN_SYSTEMD_CGROUP").is_some() {
+            let _ = systemd_create_scope(id, cgroup_dir);
+        }
         std::fs::create_dir_all(cgroup_dir)?;
         for (knob, content) in &plan.ext.cgroup_v2_writes {
             let path = cgroup_dir.join(knob);
@@ -770,6 +780,21 @@ unsafe fn child_run(
     }
     let _ = std::fs::remove_dir("/.rsrun_old");
 
+    // 4a. linux.rootfsPropagation: change `/`'s propagation mode after
+    // pivot_root. By default rsrun set it MS_PRIVATE in step 1; this
+    // overrides if the spec asked for shared/slave/etc. Skipped when
+    // the spec didn't specify (flags == empty), so the no-feature path
+    // pays nothing.
+    if !plan.rootfs_propagation.is_empty() {
+        let _ = mount(
+            Option::<&str>::None,
+            "/",
+            Option::<&str>::None,
+            plan.rootfs_propagation,
+            Option::<&str>::None,
+        );
+    }
+
     // 5. Hostname (UTS namespace) — only if explicitly set in spec.
     if plan.set_hostname {
         let _ = sethostname(plan.hostname.to_str().unwrap_or(""));
@@ -881,6 +906,19 @@ unsafe fn child_run(
             MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
             Option::<&str>::None,
         );
+    }
+
+    // 6a. Apply linux.sysctl writes. /proc is mounted by step 3 (the
+    // mount plan typically includes proc); we write each key. Failures
+    // are non-fatal — many sysctls are namespaced but kernel-version
+    // dependent. Empty list = the for loop is a no-op.
+    #[cfg(feature = "sysctl")]
+    for (path, value) in &plan.sysctls {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd >= 0 {
+            let _ = libc::write(fd, value.as_ptr() as *const _, value.len());
+            libc::close(fd);
+        }
     }
 
     // 7. Chdir to spec.cwd inside the container.
@@ -1052,11 +1090,14 @@ unsafe fn child_run(
     // wants "exec <profile>" (or "changeprofile <profile>"); SELinux
     // wants the raw context. Failures are fatal — silently running
     // unconfined would defeat the security policy the spec asked for.
-    if let Some(profile) = plan.apparmor_profile.as_ref() {
-        apply_apparmor(err_fd, profile);
-    }
-    if let Some(label) = plan.selinux_label.as_ref() {
-        apply_selinux(err_fd, label);
+    #[cfg(feature = "lsm")]
+    {
+        if let Some(profile) = plan.apparmor_profile.as_ref() {
+            apply_apparmor(err_fd, profile);
+        }
+        if let Some(label) = plan.selinux_label.as_ref() {
+            apply_selinux(err_fd, label);
+        }
     }
 
     // 9. Final exec.
@@ -1237,6 +1278,7 @@ unsafe fn reapply_effective(err_fd: i32, caps: &crate::plan::CapBitmasks) {
     }
 }
 
+#[cfg(feature = "lsm")]
 /// Stage an AppArmor profile transition for the next execve. We write
 /// "exec <profile>" to /proc/self/attr/apparmor/exec (preferred,
 /// AppArmor 4.x) or /proc/self/attr/exec (legacy fallback). The kernel
@@ -1283,6 +1325,7 @@ unsafe fn apply_apparmor(err_fd: i32, profile: &CString) {
     }
 }
 
+#[cfg(feature = "lsm")]
 /// Stage an SELinux exec context for the next execve. We write the
 /// label (with a trailing newline, mirroring libselinux's setexeccon)
 /// to /proc/self/attr/exec. ENOENT means SELinux isn't loaded — fatal
@@ -1490,6 +1533,230 @@ fn attach_device_cgroup_bpf(cgroup_dir: &Path, prog_bytes: &[u8]) -> std::io::Re
         )));
     }
     Ok(())
+}
+
+#[cfg(feature = "systemd-cgroup")]
+/// systemd cgroup driver. Calls `systemd-run --scope` to create a
+/// transient `.scope` unit whose cgroup is the one rsrun will use.
+/// systemd then owns the slice and shows it in `systemctl status`,
+/// which is what containerd / podman expect when their cgroup driver
+/// is set to systemd.
+///
+/// Best-effort: failure is logged via stderr (caught by --log) but
+/// doesn't abort `create`. The runtime falls back to plain cgroupfs.
+/// Trade-off vs. crun's full D-Bus marshaller: one extra fork+exec on
+/// `create` (only when `--systemd-cgroup` is set, so default rsrun is
+/// untouched), no zbus dependency, ~25 LOC instead of ~400.
+fn systemd_create_scope(id: &str, cgroup_dir: &std::path::Path) -> std::io::Result<()> {
+    // We point systemd-run at the cgroup path we'd create anyway.
+    // --slice picks the slice name (rsrun-<id>.slice); --scope makes
+    // it transient. --no-block returns once D-Bus accepts; we don't
+    // need to wait for the started unit (we'll never use it).
+    let scope_name = format!("rsrun-{id}.scope");
+    let status = std::process::Command::new("systemd-run")
+        .args([
+            "--no-block",
+            "--scope",
+            "--unit",
+            &scope_name,
+            "--description",
+            "rsrun container",
+            "--slice",
+            "rsrun.slice",
+            "true",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => {
+            // Non-zero exit: systemd-run might have rejected us (already
+            // exists, dbus down, etc.). Continue with cgroupfs fallback.
+            let _ = cgroup_dir;
+            Err(std::io::Error::other("systemd-run rejected"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(feature = "stats")]
+/// `rsrun events <id> [--stats]` — emit a single JSON line of cgroup-v2
+/// metrics (when --stats) or stream them every second (default).
+/// Mirror of crun's `events`. Used by `docker stats`.
+pub fn cmd_events(id: &str, stats_only: bool) -> std::io::Result<()> {
+    let cgroup_dir = std::path::PathBuf::from(format!("/sys/fs/cgroup/rsrun-{id}"));
+    if !cgroup_dir.exists() {
+        return Err(std::io::Error::other(format!(
+            "container {id} has no cgroup"
+        )));
+    }
+    if stats_only {
+        let line = render_stats_json(id, &cgroup_dir);
+        println!("{line}");
+        return Ok(());
+    }
+    loop {
+        let line = render_stats_json(id, &cgroup_dir);
+        println!("{line}");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(feature = "stats")]
+/// `rsrun stats <id>` — alias for `events --stats`. Bare convenience
+/// when the user just wants a single snapshot.
+pub fn cmd_stats(id: &str) -> std::io::Result<()> {
+    cmd_events(id, true)
+}
+
+#[cfg(feature = "stats")]
+fn render_stats_json(id: &str, cgroup_dir: &std::path::Path) -> String {
+    let read_u64 = |p: &str| -> u64 {
+        std::fs::read_to_string(cgroup_dir.join(p))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    let memory_current = read_u64("memory.current");
+    let pids_current = read_u64("pids.current");
+    // cpu.stat is "usage_usec N\nuser_usec N\n..." — pull usage_usec.
+    let cpu_usage_usec = std::fs::read_to_string(cgroup_dir.join("cpu.stat"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("usage_usec ").and_then(|n| n.parse().ok()))
+        })
+        .unwrap_or(0u64);
+    serde_json::json!({
+        "type": "stats",
+        "id": id,
+        "data": {
+            "cpu": { "usage": { "total": cpu_usage_usec * 1000 } },
+            "memory": { "usage": { "usage": memory_current } },
+            "pids": { "current": pids_current },
+        }
+    })
+    .to_string()
+}
+
+#[cfg(feature = "update")]
+/// `rsrun update <id> [--resources <path>]` — re-write cgroup-v2
+/// resource knobs of a running container. Reads either a JSON file
+/// (matching OCI's `linux.resources` shape) or stdin. Best-effort:
+/// each knob is written independently; a failed write doesn't roll
+/// back the others. Both crun and youki implement this.
+pub fn cmd_update(id: &str, resources_path: Option<&Path>) -> std::io::Result<()> {
+    let bytes = if let Some(p) = resources_path {
+        std::fs::read(p)?
+    } else {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        buf
+    };
+    let resources: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let writes = compile_resources_to_writes(&resources);
+    let cgroup_dir = std::path::PathBuf::from(format!("/sys/fs/cgroup/rsrun-{id}"));
+    if !cgroup_dir.exists() {
+        return Err(std::io::Error::other(format!(
+            "container {id} has no cgroup"
+        )));
+    }
+    for (knob, value) in &writes {
+        let _ = std::fs::write(cgroup_dir.join(knob), value);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "update")]
+/// Stripped-down mirror of `rsrun-ext::cgroup::compile_writes`. Only
+/// the v2 knobs that map 1:1 from OCI fields. Kept here so core can
+/// implement `update` without depending on rsrun-ext.
+fn compile_resources_to_writes(r: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let push_int = |out: &mut Vec<(String, Vec<u8>)>, knob: &str, n: i64| {
+        let s = if n < 0 {
+            "max\n".to_string()
+        } else {
+            format!("{n}\n")
+        };
+        out.push((knob.to_string(), s.into_bytes()));
+    };
+    if let Some(memory) = r.get("memory") {
+        if let Some(n) = memory.get("limit").and_then(|x| x.as_i64()) {
+            push_int(&mut out, "memory.max", n);
+        }
+        if let Some(n) = memory.get("swap").and_then(|x| x.as_i64()) {
+            let mem = memory.get("limit").and_then(|x| x.as_i64()).unwrap_or(0);
+            let swap_only = if mem > 0 && n >= mem { n - mem } else { n };
+            push_int(&mut out, "memory.swap.max", swap_only);
+        }
+    }
+    if let Some(cpu) = r.get("cpu") {
+        let quota = cpu.get("quota").and_then(|x| x.as_i64());
+        let period = cpu.get("period").and_then(|x| x.as_u64());
+        if quota.is_some() || period.is_some() {
+            let q = match quota {
+                Some(n) if n < 0 => "max".to_string(),
+                Some(n) => n.to_string(),
+                None => "max".to_string(),
+            };
+            let p = period.unwrap_or(100_000);
+            out.push(("cpu.max".to_string(), format!("{q} {p}\n").into_bytes()));
+        }
+        if let Some(shares) = cpu.get("shares").and_then(|x| x.as_u64()) {
+            // OCI shares 2..262144 → cgroup-v2 weight 1..10000.
+            let weight = ((shares - 2) * 9999 / 262142) + 1;
+            out.push(("cpu.weight".to_string(), format!("{weight}\n").into_bytes()));
+        }
+    }
+    if let Some(pids) = r.get("pids") {
+        if let Some(n) = pids.get("limit").and_then(|x| x.as_i64()) {
+            push_int(&mut out, "pids.max", n);
+        }
+    }
+    out
+}
+
+/// `rsrun pause <id>` — freeze the container by writing 1 to
+/// `cgroup.freeze` in the container's cgroup-v2 directory. Mirror of
+/// `cmd_resume`. Both crun and youki implement this. cgroup v1's
+/// freezer controller is *not* used here (rsrun is v2-only).
+#[cfg(feature = "pause")]
+pub fn cmd_pause(id: &str) -> std::io::Result<()> {
+    set_freeze(id, true)?;
+    update_status(id, "paused")
+}
+
+/// `rsrun resume <id>` — unfreeze.
+#[cfg(feature = "pause")]
+pub fn cmd_resume(id: &str) -> std::io::Result<()> {
+    set_freeze(id, false)?;
+    update_status(id, "running")
+}
+
+#[cfg(feature = "pause")]
+fn set_freeze(id: &str, freeze: bool) -> std::io::Result<()> {
+    let cgroup_dir = std::path::PathBuf::from(format!("/sys/fs/cgroup/rsrun-{id}"));
+    if !cgroup_dir.exists() {
+        return Err(std::io::Error::other(format!(
+            "container {id} has no cgroup (was it created without resources?)"
+        )));
+    }
+    std::fs::write(
+        cgroup_dir.join("cgroup.freeze"),
+        if freeze { b"1" } else { b"0" },
+    )
+}
+
+#[cfg(feature = "pause")]
+fn update_status(id: &str, status: &str) -> std::io::Result<()> {
+    let paths = ContainerPaths::for_id(id);
+    let bytes = std::fs::read(paths.state_file())?;
+    let mut v: serde_json::Value = serde_json::from_slice(&bytes)?;
+    v["status"] = serde_json::Value::String(status.to_string());
+    std::fs::write(paths.state_file(), serde_json::to_vec(&v)?)
 }
 
 pub fn cmd_start(id: &str) -> std::io::Result<()> {
@@ -1723,6 +1990,22 @@ pub fn cmd_exec(
     pid_file: Option<&Path>,
     detach: bool,
 ) -> std::io::Result<()> {
+    cmd_exec_full(id, process_json, pid_file, detach, None)
+}
+
+/// Same as `cmd_exec` plus a `--console-socket` path. When the
+/// `process.json` sets `terminal: true` and a console socket is
+/// available, the parent allocates a PTY pair, forwards the master
+/// fd to the engine via SCM_RIGHTS, and the exec'd child gets the
+/// slave dup'd onto stdio. Mirror of `cmd_create_full`'s TTY logic;
+/// reuses `send_pty_master`. `docker exec -it` needs this.
+pub fn cmd_exec_full(
+    id: &str,
+    process_json: &Path,
+    pid_file: Option<&Path>,
+    detach: bool,
+    console_socket: Option<&Path>,
+) -> std::io::Result<()> {
     // CVE-2019-5736 mitigation: prctl(PR_SET_DUMPABLE, 0).
     set_undumpable();
 
@@ -1742,6 +2025,17 @@ pub fn cmd_exec(
     }
 
     let pj = parse_exec_process(process_json)?;
+
+    // PTY allocation, when the spec sets terminal:true AND the engine
+    // gave us a console socket. Both fds stay -1 otherwise.
+    let mut pty_master_fd: i32 = -1;
+    let mut pty_slave_fd: i32 = -1;
+    if pj.terminal && console_socket.is_some() {
+        let res = nix::pty::openpty(None, None)?;
+        use std::os::fd::IntoRawFd;
+        pty_master_fd = res.master.into_raw_fd();
+        pty_slave_fd = res.slave.into_raw_fd();
+    }
 
     // Open ns fds in a fixed order. PID namespace must be entered before
     // we fork (kernel requirement: setns(NEWPID) only takes effect on the
@@ -1769,6 +2063,14 @@ pub fn cmd_exec(
         return Err(std::io::Error::last_os_error());
     }
     if pid > 0 {
+        // Parent: hand the PTY master to the engine, close the slave.
+        if pty_slave_fd >= 0 {
+            unsafe { libc::close(pty_slave_fd) };
+        }
+        if let (Some(socket), true) = (console_socket, pty_master_fd >= 0) {
+            send_pty_master(socket, pty_master_fd)?;
+            unsafe { libc::close(pty_master_fd) };
+        }
         if let Some(pf) = pid_file {
             std::fs::write(pf, pid.to_string())?;
         }
@@ -1793,6 +2095,27 @@ pub fn cmd_exec(
     // child_run (groups → caps → user transition → NNP → LSM staging).
     // On failure we _exit(non-zero) so the parent's waitpid surfaces it.
     unsafe {
+        // Close the parent's master end (we kept it for sending). Slave
+        // becomes our controlling terminal + stdio.
+        if pty_master_fd >= 0 {
+            libc::close(pty_master_fd);
+        }
+        if pty_slave_fd >= 0 {
+            if libc::setsid() < 0 {
+                libc::_exit(116);
+            }
+            if libc::ioctl(pty_slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                libc::_exit(117);
+            }
+            for newfd in 0..3 {
+                if libc::dup2(pty_slave_fd, newfd) < 0 {
+                    libc::_exit(118);
+                }
+            }
+            if pty_slave_fd > 2 {
+                libc::close(pty_slave_fd);
+            }
+        }
         if let Err(code) = exec_apply(&pj) {
             libc::_exit(code);
         }
@@ -1842,6 +2165,7 @@ struct ExecProcess {
     capabilities: Option<crate::plan::CapBitmasks>,
     apparmor_profile: Option<CString>,
     selinux_label: Option<CString>,
+    terminal: bool,
 }
 
 fn parse_exec_process(path: &Path) -> std::io::Result<ExecProcess> {
@@ -1927,6 +2251,10 @@ fn parse_exec_process(path: &Path) -> std::io::Result<ExecProcess> {
         .filter(|s| !s.is_empty())
         .and_then(|s| CString::new(s).ok());
 
+    let terminal = v
+        .get("terminal")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
     Ok(ExecProcess {
         args,
         env,
@@ -1938,6 +2266,7 @@ fn parse_exec_process(path: &Path) -> std::io::Result<ExecProcess> {
         capabilities,
         apparmor_profile,
         selinux_label,
+        terminal,
     })
 }
 

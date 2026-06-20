@@ -56,6 +56,13 @@ pub struct CompiledPlan {
     /// SELinux exec context (e.g. `system_u:system_r:container_t:s0`).
     /// Applied via write to `/proc/self/attr/exec`. None = no transition.
     pub selinux_label: Option<CString>,
+    /// `linux.sysctl` writes to apply inside the container, pre-built as
+    /// (path under /proc/sys/, value bytes). Empty when no sysctls in
+    /// spec — child skips the loop.
+    pub sysctls: Vec<(CString, Vec<u8>)>,
+    /// `linux.rootfsPropagation` flag (e.g. `MS_SHARED|MS_REC`). Zero
+    /// when not specified; child skips the mount call.
+    pub rootfs_propagation: nix::mount::MsFlags,
     /// Hostname to set inside the UTS namespace.
     pub hostname: CString,
     /// Resolved absolute path to rootfs.
@@ -408,7 +415,34 @@ impl CompiledPlan {
                 .as_deref()
                 .map(cstr)
                 .transpose()?,
+            sysctls: spec
+                .sysctls
+                .iter()
+                .map(|(k, v)| {
+                    let path = format!("/proc/sys/{}", k.replace('.', "/"));
+                    Ok((cstr(&path)?, v.as_bytes().to_vec()))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?,
+            rootfs_propagation: parse_propagation(spec.rootfs_propagation.as_deref()),
         })
+    }
+}
+
+/// Parse OCI rootfsPropagation strings into `MsFlags`. Returns the
+/// MsFlags::empty() when the option is None or unrecognized — the
+/// child then skips the mount() call entirely.
+fn parse_propagation(s: Option<&str>) -> nix::mount::MsFlags {
+    use nix::mount::MsFlags;
+    match s.unwrap_or("") {
+        "shared" => MsFlags::MS_SHARED,
+        "slave" => MsFlags::MS_SLAVE,
+        "private" => MsFlags::MS_PRIVATE,
+        "unbindable" => MsFlags::MS_UNBINDABLE,
+        "rshared" => MsFlags::MS_SHARED | MsFlags::MS_REC,
+        "rslave" => MsFlags::MS_SLAVE | MsFlags::MS_REC,
+        "rprivate" => MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        "runbindable" => MsFlags::MS_UNBINDABLE | MsFlags::MS_REC,
+        _ => MsFlags::empty(),
     }
 }
 

@@ -10,6 +10,24 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# All on by default; users opt out with `--no-default-features` and
+# pick what they need. Keep this list aligned with the matching
+# `#[cfg(feature = ...)]` gates in src/runtime.rs.
+default = ["pause", "update", "stats", "sysctl", "lsm", "systemd-cgroup"]
+# `pause` / `resume` verbs (cgroup-v2 cgroup.freeze).
+pause = []
+# `update` verb to retune cgroup-v2 limits on a running container.
+update = []
+# `stats` / `events` verbs (cgroup-v2 metrics).
+stats = []
+# linux.sysctl writes inside the new namespaces.
+sysctl = []
+# AppArmor + SELinux exec staging via /proc/self/attr/...
+lsm = []
+# --systemd-cgroup driver (shells out to systemd-run on `create`).
+systemd-cgroup = []
+
 [dependencies]
 nix.workspace = true
 libc.workspace = true

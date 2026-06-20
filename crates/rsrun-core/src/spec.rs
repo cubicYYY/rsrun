@@ -33,6 +33,15 @@ pub struct Spec {
     /// process.selinuxLabel: SELinux exec context. None / empty = no
     /// transition.
     pub selinux_label: Option<String>,
+    /// linux.sysctl: key→value pairs written to /proc/sys/<key> inside
+    /// the container's namespaces (only namespaced sysctls are
+    /// allowed by the kernel). Keys use dot notation
+    /// (e.g. "net.ipv4.ip_forward"); we translate to slash paths.
+    pub sysctls: Vec<(String, String)>,
+    /// linux.rootfsPropagation: one of "shared", "slave", "private",
+    /// "unbindable" (or recursive `r*` variants). Applied to `/` after
+    /// pivot_root. None = leave at MS_PRIVATE (rsrun's default).
+    pub rootfs_propagation: Option<String>,
     /// linux.maskedPaths: bind-mount /dev/null over each (file) or
     /// remount tmpfs RDONLY over each (dir).
     pub masked_paths: Vec<String>,
@@ -226,7 +235,21 @@ impl Spec {
         let mut gid_mappings = Vec::new();
         let mut masked_paths = Vec::new();
         let mut readonly_paths = Vec::new();
+        let mut sysctls: Vec<(String, String)> = Vec::new();
+        let mut rootfs_propagation = None;
         if let Some(linux) = v.get("linux") {
+            if let Some(obj) = linux.get("sysctl").and_then(Value::as_object) {
+                for (k, val) in obj {
+                    if let Some(s) = val.as_str() {
+                        sysctls.push((k.clone(), s.to_string()));
+                    }
+                }
+            }
+            rootfs_propagation = linux
+                .get("rootfsPropagation")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
             if let Some(arr) = linux.get("maskedPaths").and_then(Value::as_array) {
                 masked_paths.extend(
                     arr.iter()
@@ -326,6 +349,8 @@ impl Spec {
             user_umask,
             apparmor_profile,
             selinux_label,
+            sysctls,
+            rootfs_propagation,
             raw: v,
             bundle: bundle.to_path_buf(),
         })
