@@ -15,7 +15,7 @@ pub struct Spec {
     pub root_path: PathBuf,
     pub root_readonly: bool,
     pub hostname: String,
-    pub namespaces: Vec<NamespaceKind>,
+    pub namespaces: Vec<NamespaceEntry>,
     pub mounts: Vec<MountSpec>,
     /// Rootless: uid mappings (containerID, hostID, size) tuples.
     /// Empty when not running rootless.
@@ -27,6 +27,12 @@ pub struct Spec {
     pub capabilities: Option<Capabilities>,
     /// process.noNewPrivileges: set PR_SET_NO_NEW_PRIVS before exec.
     pub no_new_privileges: bool,
+    /// process.apparmorProfile: profile name to transition into at exec.
+    /// None / empty = no transition.
+    pub apparmor_profile: Option<String>,
+    /// process.selinuxLabel: SELinux exec context. None / empty = no
+    /// transition.
+    pub selinux_label: Option<String>,
     /// linux.maskedPaths: bind-mount /dev/null over each (file) or
     /// remount tmpfs RDONLY over each (dir).
     pub masked_paths: Vec<String>,
@@ -36,6 +42,13 @@ pub struct Spec {
     pub user_gid: u32,
     pub user_additional_gids: Vec<u32>,
     pub user_umask: Option<u32>,
+    /// Raw parsed config.json. Kept so ext can parse seccomp, cgroup
+    /// resources, hooks, and devices without re-reading the file.
+    pub raw: Value,
+    /// Bundle directory (the `-b` argument to `rsrun create`). Hook
+    /// commands and seccomp profile paths may be resolved relative
+    /// to this.
+    pub bundle: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +105,16 @@ pub enum NamespaceKind {
     Cgroup,
 }
 
+/// A namespace declaration. `path = None` means create a fresh namespace
+/// (the standard case); `path = Some(p)` means setns(2) into the
+/// pre-existing namespace at that path. The latter is what the daemon
+/// uses for pre-warmed namespace pools.
+#[derive(Debug, Clone)]
+pub struct NamespaceEntry {
+    pub kind: NamespaceKind,
+    pub path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MountSpec {
     pub destination: String,
@@ -106,7 +129,13 @@ impl Spec {
         let bytes = std::fs::read(&path)?;
         let v: Value = serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Self::from_value(v, bundle)
+    }
 
+    /// Test-friendly variant that takes a parsed JSON value directly,
+    /// without reading from disk. Used by unit tests; production callers
+    /// go through `from_bundle`.
+    pub fn from_value(v: Value, bundle: &std::path::Path) -> std::io::Result<Self> {
         let process = v.get("process").ok_or_else(missing("process"))?;
         let args = string_array(process.get("args").ok_or_else(missing("process.args"))?);
         let env = process
@@ -126,6 +155,16 @@ impl Spec {
             .get("noNewPrivileges")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let apparmor_profile = process
+            .get("apparmorProfile")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let selinux_label = process
+            .get("selinuxLabel")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
 
         let mut rlimits = Vec::new();
         if let Some(arr) = process.get("rlimits").and_then(Value::as_array) {
@@ -204,7 +243,12 @@ impl Spec {
                 for ns in nsa {
                     if let Some(ty) = ns.get("type").and_then(Value::as_str) {
                         if let Some(k) = parse_ns(ty) {
-                            namespaces.push(k);
+                            let path = ns
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(PathBuf::from);
+                            namespaces.push(NamespaceEntry { kind: k, path });
                         }
                     }
                 }
@@ -280,6 +324,10 @@ impl Spec {
             user_gid,
             user_additional_gids,
             user_umask,
+            apparmor_profile,
+            selinux_label,
+            raw: v,
+            bundle: bundle.to_path_buf(),
         })
     }
 }
@@ -370,5 +418,131 @@ fn missing(field: &'static str) -> impl Fn() -> std::io::Error {
             std::io::ErrorKind::InvalidData,
             format!("missing OCI field: {field}"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn minimal() -> serde_json::Value {
+        json!({
+            "process": {"args": ["/bin/true"]},
+            "root": {"path": "rootfs"}
+        })
+    }
+
+    #[test]
+    fn defaults_when_optional_fields_missing() {
+        let spec = Spec::from_value(minimal(), Path::new("/bundle")).unwrap();
+        assert_eq!(spec.args, vec!["/bin/true".to_string()]);
+        assert!(spec.env.is_empty());
+        assert_eq!(spec.cwd, "/");
+        assert!(!spec.terminal);
+        assert!(!spec.no_new_privileges);
+        assert!(!spec.root_readonly);
+        assert_eq!(spec.hostname, "rsrun");
+        assert!(spec.namespaces.is_empty());
+        assert_eq!(spec.user_uid, 0);
+        assert_eq!(spec.user_gid, 0);
+    }
+
+    #[test]
+    fn missing_required_field_errors() {
+        let no_process = json!({"root": {"path": "rootfs"}});
+        assert!(Spec::from_value(no_process, Path::new("/bundle")).is_err());
+
+        let no_root = json!({"process": {"args": ["/bin/true"]}});
+        assert!(Spec::from_value(no_root, Path::new("/bundle")).is_err());
+
+        let no_args = json!({"process": {}, "root": {"path": "rootfs"}});
+        assert!(Spec::from_value(no_args, Path::new("/bundle")).is_err());
+    }
+
+    #[test]
+    fn relative_rootfs_resolves_against_bundle() {
+        let v = minimal();
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        assert_eq!(spec.root_path, Path::new("/bundle/rootfs"));
+    }
+
+    #[test]
+    fn absolute_rootfs_unchanged() {
+        let v = json!({
+            "process": {"args": ["/bin/true"]},
+            "root": {"path": "/abs/rootfs"}
+        });
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        assert_eq!(spec.root_path, Path::new("/abs/rootfs"));
+    }
+
+    #[test]
+    fn namespaces_with_and_without_path() {
+        let v = json!({
+            "process": {"args": ["/bin/true"]},
+            "root": {"path": "rootfs"},
+            "linux": {
+                "namespaces": [
+                    {"type": "pid"},
+                    {"type": "network", "path": "/var/run/netns/red"},
+                    {"type": "user", "path": ""}
+                ]
+            }
+        });
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        assert_eq!(spec.namespaces.len(), 3);
+        assert_eq!(spec.namespaces[0].kind, NamespaceKind::Pid);
+        assert!(spec.namespaces[0].path.is_none());
+        assert_eq!(spec.namespaces[1].kind, NamespaceKind::Network);
+        assert_eq!(
+            spec.namespaces[1].path.as_deref(),
+            Some(Path::new("/var/run/netns/red"))
+        );
+        // Empty string is treated as "no path" (regression: `path: ""`
+        // shouldn't kick the namespace into setns mode).
+        assert_eq!(spec.namespaces[2].kind, NamespaceKind::User);
+        assert!(spec.namespaces[2].path.is_none());
+    }
+
+    #[test]
+    fn rlimits_and_capabilities() {
+        let v = json!({
+            "process": {
+                "args": ["/bin/true"],
+                "rlimits": [
+                    {"type": "RLIMIT_NOFILE", "soft": 1024, "hard": 4096},
+                    {"type": "RLIMIT_NOTAREAL", "soft": 1, "hard": 1}
+                ],
+                "capabilities": {
+                    "bounding": ["CAP_NET_BIND_SERVICE"],
+                    "effective": ["CAP_NET_BIND_SERVICE"],
+                    "permitted": ["CAP_NET_BIND_SERVICE"],
+                    "inheritable": [],
+                    "ambient": []
+                }
+            },
+            "root": {"path": "rootfs"}
+        });
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        // Unknown rlimit kinds are dropped, valid one survives.
+        assert_eq!(spec.rlimits.len(), 1);
+        assert_eq!(spec.rlimits[0].kind, RLimitKind::Nofile);
+        assert_eq!(spec.rlimits[0].soft, 1024);
+        let caps = spec.capabilities.unwrap();
+        assert_eq!(caps.bounding, vec!["CAP_NET_BIND_SERVICE".to_string()]);
+        assert!(caps.inheritable.is_empty());
+    }
+
+    #[test]
+    fn empty_hostname_uses_rsrun_default() {
+        // Spec parser substitutes "rsrun" when hostname is absent.
+        // Empty-string in spec is honored verbatim (caller decides
+        // semantics); plan converts empty to set_hostname=false.
+        let mut v = minimal();
+        v["hostname"] = json!("");
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        assert_eq!(spec.hostname, "");
     }
 }

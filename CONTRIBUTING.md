@@ -6,16 +6,32 @@ to review and land than sweeping refactors.
 
 ## Development
 
+rsrun is Linux-only. The crate uses Linux-only types (`clone3`,
+`MsFlags`, `rlimit64`, …) directly without `#[cfg(target_os = "linux")]`
+gates — `cargo build` on macOS is expected to fail with type errors,
+because the code wouldn't function there even if it compiled.
+
+For development on a macOS / Windows host, run cargo inside a Linux VM.
+The project uses [Lima]:
+
 ```sh
-cargo build           # debug
-cargo build --release # release (use this for benches)
+limactl shell bench   # or whatever VM you set up
+cd /path/to/rsrun
+cargo build              # debug
+cargo build --release    # release (use this for benches)
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test               # 40 unit tests in <1s
 ```
 
-rsrun is Linux-only. The `cargo` build will succeed on macOS for IDE /
-editor support, but the binary errors out at runtime.
+For IDE support on macOS, point rust-analyzer at the Linux target by
+adding to `.vscode/settings.json` or your editor's rust-analyzer config:
+
+```json
+{ "rust-analyzer.cargo.target": "aarch64-unknown-linux-gnu" }
+```
+
+[Lima]: https://github.com/lima-vm/lima
 
 ## Reporting bugs
 

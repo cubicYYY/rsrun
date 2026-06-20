@@ -1,21 +1,12 @@
 //! rsrun — a small OCI runtime in Rust.
 
-mod runtime;
-
-#[cfg(target_os = "linux")]
-mod clone3;
-#[cfg(target_os = "linux")]
-mod plan;
-#[cfg(target_os = "linux")]
-mod spec;
-#[cfg(target_os = "linux")]
-mod state;
+use rsrun_core as runtime;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Top-level CLI. Global options here mirror the runc / crun / youki
+/// Top-level CLI. Global options follow the standard OCI-runtime
 /// shape so containerd's shim can drive rsrun without translation.
 #[derive(Parser)]
 #[command(name = "rsrun", version, about = "A small OCI runtime in Rust.")]
@@ -32,15 +23,15 @@ struct Cli {
     #[arg(long = "log-format", global = true)]
     log_format: Option<String>,
 
-    /// Accepted for runc compatibility; rootless is autodetected by uid.
+    /// Accepted for engine compatibility; rootless is autodetected by uid.
     #[arg(long, global = true)]
     rootless: Option<String>,
 
-    /// Accepted for runc compatibility; no cgroup driver yet.
+    /// Accepted for engine compatibility; no cgroup driver yet.
     #[arg(long = "systemd-cgroup", global = true)]
     systemd_cgroup: bool,
 
-    /// Accepted for runc compatibility; no-op.
+    /// Accepted for engine compatibility; no-op.
     #[arg(long, global = true)]
     debug: bool,
 
@@ -56,9 +47,10 @@ enum Cmd {
         bundle: PathBuf,
         #[arg(long = "pid-file")]
         pid_file: Option<PathBuf>,
-        /// Accepted, ignored. No console support yet.
+        /// AF_UNIX socket the engine listens on for the PTY master fd.
+        /// Used when the bundle sets `process.terminal: true`.
         #[arg(long = "console-socket")]
-        _console_socket: Option<String>,
+        console_socket: Option<PathBuf>,
         /// Accepted, ignored.
         #[arg(long = "preserve-fds")]
         _preserve_fds: Option<String>,
@@ -91,7 +83,7 @@ enum Cmd {
         pid_file: Option<PathBuf>,
         #[arg(short, long)]
         detach: bool,
-        // Args below accepted for runc/Docker compatibility but unused here.
+        // Args below accepted for engine compatibility but unused here.
         #[arg(short, long)]
         _tty: bool,
         #[arg(long = "console-socket")]
@@ -153,8 +145,8 @@ fn main() -> ExitCode {
     }
 
     let res: std::io::Result<()> = match cli.cmd {
-        Cmd::Create { bundle, pid_file, id, .. } => {
-            runtime::cmd_create(&id, &bundle, pid_file.as_deref())
+        Cmd::Create { bundle, pid_file, console_socket, id, .. } => {
+            create_with_ext(&id, &bundle, pid_file.as_deref(), console_socket.as_deref())
         }
         Cmd::Start { id } => runtime::cmd_start(&id),
         Cmd::Delete { force, id } => runtime::cmd_delete(&id, force),
@@ -229,4 +221,19 @@ fn sub_features() -> std::io::Result<()> {
     });
     println!("{}", serde_json::to_string(&f)?);
     Ok(())
+}
+
+/// Build an `ExtPlan` (seccomp, cgroup limits, hooks, devices) from the
+/// bundle and hand it to core, threading through the optional console
+/// socket.
+fn create_with_ext(
+    id: &str,
+    bundle: &std::path::Path,
+    pid_file: Option<&std::path::Path>,
+    console_socket: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let canonical = bundle.canonicalize()?;
+    let spec = rsrun_core::spec::Spec::from_bundle(&canonical)?;
+    let ext = rsrun_ext::compile(&spec, id)?;
+    runtime::cmd_create_full(id, bundle, pid_file, ext, console_socket)
 }

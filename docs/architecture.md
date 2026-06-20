@@ -5,13 +5,40 @@ child (the container init). All namespace setup happens in a single
 `clone3` syscall; the child does its own rootfs / mount / capability
 work; a FIFO under `/run/rsrun/<id>/` separates `create` from `start`.
 
-## Source layout
+## Workspace layout
 
 ```
-src/
-├── main.rs           CLI dispatch + runc-style global flag parsing
+rsrun/
+└── crates/
+    ├── rsrun-core/   (lib, depended on by both rsrun and rsrund)
+    ├── rsrun-ext/    (lib, depended on by rsrun only)
+    └── rsrun/        (bin)
+```
+
+- **`rsrun-core`** holds the syscall-floor lifecycle: `clone3`,
+  namespaces, mounts, `pivot_root`, capabilities, rlimits, default
+  `/dev`, `noNewPrivileges`, `process.user`, `linux.namespaces[].path`
+  joining, basic `exec`. The hot-path benchmark numbers all live here.
+- **`rsrun-ext`** holds features used only by the standalone `rsrun`
+  CLI: seccomp profile compilation, cgroup-v2 limits, OCI hooks,
+  `linux.devices` parsing. Each is opt-in: an empty `ExtPlan` makes
+  core skip the corresponding install step.
+- **`rsrun` (bin)** orchestrates: parse argv, load the spec, ask
+  `rsrun-ext` to build an `ExtPlan` from the spec extras, hand it to
+  `rsrun-core::cmd_create_with_ext`.
+
+The future `rsrund` daemon depends only on `rsrun-core` and passes
+`ExtPlan::default()` to skip the heavy work — its trust model
+(pre-warmed namespaces, trusted agents) doesn't need per-container
+seccomp / cgroup limits / hooks.
+
+## Source files (under `crates/rsrun-core/src/`)
+
+```
+crates/rsrun-core/src/
+├── lib.rs            crate root + public API re-exports
 ├── spec.rs           config.json → Spec
-├── plan.rs           Spec → CompiledPlan (decision-free)
+├── plan.rs           Spec → CompiledPlan (decision-free) + ExtPlan
 ├── clone3.rs         Direct clone3 syscall wrapper
 ├── runtime.rs        Platform dispatch (Linux vs stub)
 ├── runtime_linux.rs  Lifecycle implementation

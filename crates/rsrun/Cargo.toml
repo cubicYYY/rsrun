@@ -1,0 +1,23 @@
+[package]
+name = "rsrun"
+description = "A small OCI runtime in Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["container", "oci", "runtime"]
+categories = ["virtualization", "command-line-utilities"]
+
+[[bin]]
+name = "rsrun"
+path = "src/main.rs"
+
+[dependencies]
+nix.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+rsrun-core = { path = "../rsrun-core" }
+rsrun-ext = { path = "../rsrun-ext" }
