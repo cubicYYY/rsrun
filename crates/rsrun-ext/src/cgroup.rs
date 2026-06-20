@@ -26,7 +26,18 @@ pub fn compile(
     }
 
     let writes = compile_writes(resources);
-    if writes.is_empty() {
+
+    // The cgroup directory is needed if EITHER (a) we have knob writes
+    // (memory.max etc.) OR (b) we have device rules to attach a BPF
+    // program to. We can't tell from here whether device rules exist
+    // (`devices::compile` runs separately), but we can check the spec.
+    let has_devices = resources
+        .get("devices")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    if writes.is_empty() && !has_devices {
         return Ok((None, Vec::new()));
     }
     let dir = PathBuf::from(format!("{CGROUP_V2_ROOT}/rsrun-{container_id}"));

@@ -208,6 +208,18 @@ pub fn cmd_create_full(
             // worse than soft-failing on a missing knob.
             let _ = std::fs::write(&path, content);
         }
+        // Attach the device cgroup BPF program (linux.resources.devices)
+        // to the cgroup directory. The kernel ref-counts attached
+        // programs through the cgroup, so dropping the OwnedFd here
+        // does NOT detach — the program stays in force until the
+        // cgroup is destroyed at delete time. Empty `device_cgroup_bpf`
+        // means no rules in the spec; we skip the syscall pair entirely
+        // and the cgroup-v2 default (allow everything writable from
+        // parent) applies. Failures here block create — running with
+        // device rules silently dropped is a security regression.
+        if !plan.ext.device_cgroup_bpf.is_empty() {
+            attach_device_cgroup_bpf(cgroup_dir, &plan.ext.device_cgroup_bpf)?;
+        }
     }
 
     // OCI hook phase: createRuntime fires AFTER namespaces are created
@@ -1290,6 +1302,194 @@ unsafe fn apply_selinux(err_fd: i32, label: &CString) {
     if w < 0 || w as usize != lbl_bytes.len() {
         child_die(err_fd, 121, b"write selinux label failed");
     }
+}
+
+/// Load the device cgroup eBPF program and attach it to the cgroup-v2
+/// directory at `cgroup_dir`. Pure syscall glue — the program bytes
+/// were emitted by `rsrun-ext::devices`. Two `bpf(2)` calls on the
+/// success path; one `setrlimit` retry only on kernels < 5.11 where
+/// memlock accounting is required. The returned program fd is dropped
+/// here: the kernel ref-counts attached programs through the cgroup,
+/// so the program stays in force until the cgroup itself is removed
+/// at `delete` time.
+fn attach_device_cgroup_bpf(cgroup_dir: &Path, prog_bytes: &[u8]) -> std::io::Result<()> {
+    if prog_bytes.len() % 8 != 0 {
+        return Err(std::io::Error::other(
+            "device cgroup BPF program length not 8-byte aligned",
+        ));
+    }
+    let insn_cnt = (prog_bytes.len() / 8) as u32;
+
+    // The kernel BPF_PROG_LOAD path of `union bpf_attr` (see
+    // <linux/bpf.h>). Field order and sizes are ABI; the kernel rejects
+    // calls with `size > sizeof(struct bpf_attr)` if the extra bytes
+    // are non-zero (E2BIG). We match exactly the kernel layout up to
+    // `fd_array`. Padding before `fd_array` is the kernel's `:32; pad`.
+    #[repr(C)]
+    struct LoadAttr {
+        prog_type: u32,
+        insn_cnt: u32,
+        insns: u64,
+        license: u64,
+        log_level: u32,
+        log_size: u32,
+        log_buf: u64,
+        kern_version: u32,
+        prog_flags: u32,
+        prog_name: [u8; 16],
+        prog_ifindex: u32,
+        expected_attach_type: u32,
+        prog_btf_fd: u32,
+        func_info_rec_size: u32,
+        func_info: u64,
+        func_info_cnt: u32,
+        line_info_rec_size: u32,
+        line_info: u64,
+        line_info_cnt: u32,
+        attach_btf_id: u32,
+        attach_prog_fd: u32,
+        _pad32: u32,
+        fd_array: u64,
+    }
+    #[repr(C)]
+    struct AttachAttr {
+        target_fd: u32,
+        attach_bpf_fd: u32,
+        attach_type: u32,
+        attach_flags: u32,
+        replace_bpf_fd: u32,
+        _pad: [u32; 3],
+    }
+    const BPF_PROG_LOAD: u32 = 5;
+    const BPF_PROG_ATTACH: u32 = 8;
+    // bpf_prog_type enum value for BPF_PROG_TYPE_CGROUP_DEVICE.
+    const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+    // bpf_attach_type enum value for BPF_CGROUP_DEVICE.
+    const BPF_CGROUP_DEVICE_ATTACH: u32 = 6;
+
+    let license = b"GPL\0";
+    let load = |attr_ptr: *mut LoadAttr| -> i64 {
+        unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_PROG_LOAD,
+                attr_ptr,
+                std::mem::size_of::<LoadAttr>(),
+            )
+        }
+    };
+    let mut attr = LoadAttr {
+        prog_type: BPF_PROG_TYPE_CGROUP_DEVICE,
+        insn_cnt,
+        insns: prog_bytes.as_ptr() as u64,
+        license: license.as_ptr() as u64,
+        log_level: 0,
+        log_size: 0,
+        log_buf: 0,
+        kern_version: 0,
+        prog_flags: 0,
+        prog_name: [0; 16],
+        prog_ifindex: 0,
+        expected_attach_type: 0,
+        prog_btf_fd: 0,
+        func_info_rec_size: 0,
+        func_info: 0,
+        func_info_cnt: 0,
+        line_info_rec_size: 0,
+        line_info: 0,
+        line_info_cnt: 0,
+        attach_btf_id: 0,
+        attach_prog_fd: 0,
+        _pad32: 0,
+        fd_array: 0,
+    };
+    let mut prog_fd = load(&mut attr);
+    if prog_fd < 0 {
+        // Capture verifier log on EINVAL to make the failure debuggable.
+        let e0 = std::io::Error::last_os_error();
+        if e0.raw_os_error() == Some(libc::EINVAL) {
+            let mut log = vec![0u8; 16 * 1024];
+            attr.log_level = 1;
+            attr.log_size = log.len() as u32;
+            attr.log_buf = log.as_mut_ptr() as u64;
+            let _ = load(&mut attr);
+            let len = log.iter().position(|&b| b == 0).unwrap_or(log.len());
+            let s = String::from_utf8_lossy(&log[..len]);
+            return Err(std::io::Error::other(format!(
+                "BPF verifier rejected device program (EINVAL):\n{s}"
+            )));
+        }
+        // EPERM on kernel < 5.11 means RLIMIT_MEMLOCK exhausted. Bump
+        // and retry once. On kernel ≥ 5.11 BPF accounts via memcg, so
+        // memlock is irrelevant and this retry is harmless.
+        let rl = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_MEMLOCK, &rl);
+        }
+        prog_fd = load(&mut attr);
+        if prog_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let prog_fd = prog_fd as i32;
+
+    let cgroup_cstr = CString::new(cgroup_dir.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::other("cgroup path NUL"))?;
+    let cgroup_fd = unsafe {
+        libc::open(
+            cgroup_cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if cgroup_fd < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(prog_fd) };
+        return Err(e);
+    }
+    // BPF_F_ALLOW_MULTI: allow our program to coexist with cgroup
+    // device programs already attached to ancestor cgroups (systemd
+    // attaches one at every service slice). Without this flag the
+    // kernel returns EINVAL on attach to a non-root cgroup whose
+    // ancestors already have a device program.
+    const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
+    let attach = AttachAttr {
+        target_fd: cgroup_fd as u32,
+        attach_bpf_fd: prog_fd as u32,
+        attach_type: BPF_CGROUP_DEVICE_ATTACH,
+        attach_flags: BPF_F_ALLOW_MULTI,
+        replace_bpf_fd: 0,
+        _pad: [0; 3],
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_ATTACH,
+            &attach as *const _,
+            std::mem::size_of::<AttachAttr>(),
+        )
+    };
+    let attach_err = if rc < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::close(cgroup_fd);
+        // Once attached, the kernel keeps the program alive via the
+        // cgroup. Closing prog_fd here releases our userland reference
+        // but does NOT detach.
+        libc::close(prog_fd);
+    }
+    if let Some(e) = attach_err {
+        return Err(std::io::Error::other(format!(
+            "BPF_PROG_ATTACH (cgroup={}): {e}",
+            cgroup_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn cmd_start(id: &str) -> std::io::Result<()> {

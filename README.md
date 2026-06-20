@@ -81,6 +81,11 @@ What works:
 - **AppArmor / SELinux** - `process.apparmorProfile` and
   `process.selinuxLabel` staged via `/proc/self/attr/...` for the
   next execve, matching libapparmor / libselinux semantics.
+- **Device cgroup BPF** - `linux.resources.devices` allow/deny rules
+  compiled to a `BPF_PROG_TYPE_CGROUP_DEVICE` program (~200 LOC,
+  hand-rolled, no libbpf) and attached to the container's cgroup-v2
+  directory. Default OCI devices and `linux.devices` entries are
+  implicitly allowed.
 - **`exec` with full OCI semantics** - honors `process.json`'s `user`,
   `capabilities`, `noNewPrivileges`, `apparmorProfile`, `selinuxLabel`,
   applied in the kernel-required order (groups → caps → user → NNP → LSM).
@@ -90,8 +95,6 @@ What works:
 
 What's not done yet:
 
-- Custom device cgroup rules (`linux.resources.devices` - default
-  cgroup-v2 device posture is enforced)
 - systemd cgroup driver (cgroupfs only)
 - cgroup v1 (v2 only)
 - Network configuration (netns flag set, no interface setup)
@@ -141,6 +144,9 @@ docker run --rm --runtime=rsrun alpine echo hello
 
 - [docs/architecture.md](docs/architecture.md) - process model, the
   child code path, the `CompiledPlan` idea
+- [docs/implementation-notes.md](docs/implementation-notes.md) - how
+  the non-trivial features (PID-ns join, device cgroup BPF, hooks,
+  LSMs) were built and the trade-offs each choice carries
 - [docs/benchmarks.md](docs/benchmarks.md) - full performance and
   memory-footprint numbers
 - [docs/oci-compliance.md](docs/oci-compliance.md) - what the

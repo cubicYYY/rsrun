@@ -32,53 +32,81 @@ The future `rsrund` daemon depends only on `rsrun-core` and passes
 (pre-warmed namespaces, trusted agents) doesn't need per-container
 seccomp / cgroup limits / hooks.
 
-## Source files (under `crates/rsrun-core/src/`)
+## Source files
 
 ```
 crates/rsrun-core/src/
-├── lib.rs            crate root + public API re-exports
-├── spec.rs           config.json → Spec
-├── plan.rs           Spec → CompiledPlan (decision-free) + ExtPlan
-├── clone3.rs         Direct clone3 syscall wrapper
-├── runtime.rs        Platform dispatch (Linux vs stub)
-├── runtime_linux.rs  Lifecycle implementation
-├── runtime_stub.rs   Non-Linux compile-only stubs
-└── state.rs          /run/rsrun/<id>/{state.json, init.pid, init.fifo}
+├── lib.rs       crate root + public API re-exports
+├── spec.rs      config.json → Spec
+├── plan.rs      Spec → CompiledPlan (decision-free) + ExtPlan
+├── clone3.rs    Direct clone3 syscall wrapper
+├── runtime.rs   Lifecycle implementation (single Linux file)
+└── state.rs     /run/rsrun/<id>/{state.json, init.pid, init.fifo, hooks.json}
+
+crates/rsrun-ext/src/
+├── lib.rs       composes spec → ExtPlan
+├── seccomp.rs   OCI seccomp profile → BPF (via seccompiler)
+├── cgroup.rs    OCI resources → cgroup-v2 file writes
+├── devices.rs   OCI device rules → eBPF (BPF_PROG_TYPE_CGROUP_DEVICE)
+└── hooks.rs     OCI hooks → HookCmd entries
 ```
+
+Linux-only (no cfg gates, no stubs). For dev on non-Linux hosts, run
+cargo inside a Lima/Vagrant VM.
 
 ## Process model
 
+Default 2-process path (one fork via `clone3`):
+
 ```
-parent ──clone3(NEWPID|NEWNS|NEWNET|NEWIPC|NEWUTS|NEWCGROUP[|NEWUSER])──► child
-  │                                                                       │
-  │                                            [rootless: read 1 byte from sync pipe]
-  │                                            ├─ open FIFO RDONLY|NONBLOCK
-  │                                            ├─ mount(/, MS_REC|MS_PRIVATE)
-  │                                            ├─ bind rootfs onto itself
-  │                                            ├─ exec mount plan
-  │                                            ├─ /dev mknod + symlinks
-  │                                            ├─ masked + readonly paths
-  │                                            ├─ pivot_root + chdir(/)
-  │                                            ├─ sethostname
-  │                                            ├─ chdir(spec.cwd)
-  │                                            ├─ poll(POLLIN) on FIFO ◀── waits for `start`
-  │                                            ├─ rlimits, caps, user transition,
-  │                                            │  no_new_privileges
-  │                                            └─ execvpe(argv[0], argv, envp)
+parent                                                child
+  │
+  ├─ mkfifo + pre-open FIFO RDONLY|NONBLOCK
+  │  └─ fd inherits across clone3 (no CLOEXEC)
+  ├─ create cgroup dir + write knobs + attach device BPF
+  ├─ fire createRuntime + prestart hooks
+  ├─ clone3(all NS flags atomic) ────────────────────►│
+  │                                                   ├─ [rootless: read sync pipe]
+  │                                                   ├─ setns paths (if any)
+  │                                                   ├─ mount(/, MS_REC|MS_PRIVATE)
+  │                                                   ├─ bind rootfs onto itself
+  │                                                   ├─ exec mount plan
+  │                                                   ├─ pivot_root + chdir(/)
+  │                                                   ├─ sethostname / chdir
+  │                                                   ├─ /dev mknod + symlinks
+  │                                                   ├─ masked + readonly paths
+  │                                                   ├─ poll(POLLIN) on FIFO  ◀── waits for `start`
+  │                                                   ├─ rlimits, caps, user
+  │                                                   ├─ no_new_privileges
+  │                                                   ├─ seccomp install
+  │                                                   ├─ AppArmor/SELinux stage
+  │                                                   ├─ startContainer hooks
+  │                                                   └─ execvpe(argv[0], argv, envp)
   │
   │ [rootless: write uid_map / gid_map / setgroups; signal sync pipe]
-  ├─ write /run/rsrun/<id>/init.pid
-  ├─ write state.json (status="created")
+  ├─ write /run/rsrun/<id>/init.pid + state.json
   └─ exit 0
 ```
 
-Rootless adds a sync round-trip so the child waits until the parent has
-installed `uid_map` / `gid_map`. Rootful skips the pipe entirely; the
-hot path takes one predicted-not-taken branch.
+The FIFO is parent-opened and the read-fd is inherited into the child.
+Two reasons: (1) under user-ns, the child's mapped uid can't traverse
+`/run/rsrun/<id>/` (host-root-owned); (2) saves one `open(2)` from the
+hot path.
 
 `start` opens the FIFO write-side and writes one byte; the child wakes
 out of `poll` and proceeds to exec. `delete` sends `SIGKILL` and
 `waitpid`s.
+
+### 3-process path (only on PID-ns join by path)
+
+When `linux.namespaces[].path` joins an existing PID namespace, the
+child must fork *once more* after `setns(CLONE_NEWPID)` because that
+flag only takes effect for the caller's future children. rsrun
+allocates a small relay pipe before clone3; the intermediate writes the
+grandchild's host-ns pid back over it and exits, the parent reads the
+pid and uses it as the recorded init. Same shape crun uses
+(`libcrun/linux.c`, `idx_pidns_to_join_immediately`). The default path
+stays at one fork.
 
 ## CompiledPlan
 

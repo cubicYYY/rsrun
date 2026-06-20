@@ -53,6 +53,15 @@ These are the missing pieces that affect everyday `docker run` /
 
 ### Workload isolation
 
+- **Device cgroup BPF** (`linux.resources.devices`). Hand-rolled eBPF
+  emitter (~200 LOC, zero new crate deps) compiles allow/deny rules
+  to a `BPF_PROG_TYPE_CGROUP_DEVICE` program and attaches it to the
+  cgroup-v2 directory via two `bpf(2)` syscalls. The OCI default
+  devices (/dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom,
+  /dev/tty) and entries from `linux.devices` are implicitly allowed —
+  required for the runtime's own mknod step to succeed under a
+  spec-default deny-all rule. First-match-wins, with a wildcard rule
+  short-circuiting later emission (matches crun's HAS_WILDCARD logic).
 - **Custom seccomp argument matching**. OCI seccomp's per-syscall
   `args` field (compare argument values, not just syscall names).
   Used for filters like "allow `clone()` only without `CLONE_NEWUSER`."

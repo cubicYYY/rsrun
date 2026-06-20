@@ -16,12 +16,19 @@ pub fn compile(
     let linux = spec.raw.get("linux");
     let seccomp_value = linux.and_then(|l| l.get("seccomp"));
     let resources = linux.and_then(|l| l.get("resources"));
-    let devices_value = linux.and_then(|l| l.get("devices"));
     let hooks_value = spec.raw.get("hooks");
 
     let seccomp_bpf = seccomp::compile(seccomp_value)?;
     let (cgroup_v2_path, cgroup_v2_writes) = cgroup::compile(resources, container_id)?;
-    let device_cgroup_bpf = devices::compile(devices_value)?;
+    // Device cgroup rules live under `linux.resources.devices`, NOT
+    // `linux.devices` (which is the device *creation* list, applied via
+    // mknod inside the rootfs). The eBPF program is what enforces
+    // allow/deny semantics on every device access. Pass the spec's
+    // `linux.devices` list too so we can implicitly allow them — the
+    // child needs to mknod those before exec, which the BPF would
+    // otherwise refuse under a deny-all rule.
+    let extra_devices = linux.and_then(|l| l.get("devices"));
+    let device_cgroup_bpf = devices::compile(resources, extra_devices)?;
     let hooks = hooks::compile(hooks_value, &spec.bundle)?;
 
     Ok(rsrun_core::plan::ExtPlan {
