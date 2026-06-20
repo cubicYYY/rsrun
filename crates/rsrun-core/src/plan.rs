@@ -9,6 +9,19 @@ use nix::sched::CloneFlags;
 use std::ffi::CString;
 use std::path::PathBuf;
 
+/// Per-invocation options the CLI passes to `cmd_create_full` that
+/// don't belong on the spec-derived `CompiledPlan`. Defaults to
+/// "no preserve_fds, use pivot_root".
+#[derive(Default, Clone, Copy)]
+pub struct CreateOpts {
+    /// Mark fds 3..=preserve_fds+2 as non-CLOEXEC in the parent before
+    /// clone3 so they inherit into the container init. 0 = none.
+    pub preserve_fds: u32,
+    /// Use chroot(2) instead of pivot_root(2). Engines pass this for
+    /// read-only rootfs setups where pivot_root would fail.
+    pub no_pivot: bool,
+}
+
 pub struct CompiledPlan {
     /// Pre-existing namespaces to join via setns(2) before clone3.
     /// These come from `linux.namespaces[].path` in the spec; the named
@@ -63,6 +76,15 @@ pub struct CompiledPlan {
     /// `linux.rootfsPropagation` flag (e.g. `MS_SHARED|MS_REC`). Zero
     /// when not specified; child skips the mount call.
     pub rootfs_propagation: nix::mount::MsFlags,
+    /// `--no-pivot` engine flag. When true the child uses chroot(2)
+    /// instead of pivot_root(2). Default false (rsrun's pivot_root path
+    /// is the safer default; chroot is only needed for read-only
+    /// rootfs setups where pivot_root would fail).
+    pub no_pivot: bool,
+    /// `process.oomScoreAdj` from the spec. None = leave kernel default.
+    /// Written from the parent to /proc/<pid>/oom_score_adj after
+    /// clone3 returns, before `start` would unblock the FIFO.
+    pub oom_score_adj: Option<i32>,
     /// Hostname to set inside the UTS namespace.
     pub hostname: CString,
     /// Resolved absolute path to rootfs.
@@ -92,6 +114,11 @@ pub struct MountOp {
     pub fstype: CString,
     pub flags: nix::mount::MsFlags,
     pub data: Option<CString>,
+    /// Pre-formatted "0 1000 65536\n..." for `linux.mounts[].uidMappings`.
+    /// Empty when this mount is not idmapped — the parent skips spawning
+    /// the helper task and the child skips `mount_setattr`.
+    pub idmap_uid: Vec<u8>,
+    pub idmap_gid: Vec<u8>,
 }
 
 /// Pre-compiled extras supplied by `rsrun-ext`. Empty fields mean
@@ -424,6 +451,8 @@ impl CompiledPlan {
                 })
                 .collect::<std::io::Result<Vec<_>>>()?,
             rootfs_propagation: parse_propagation(spec.rootfs_propagation.as_deref()),
+            no_pivot: false,
+            oom_score_adj: spec.oom_score_adj,
         })
     }
 }
@@ -567,6 +596,8 @@ fn compile_mount(m: &crate::spec::MountSpec, root: &std::path::Path) -> std::io:
         fstype: cstr(&m.fstype)?,
         flags,
         data,
+        idmap_uid: format_id_map(&m.uid_mappings),
+        idmap_gid: format_id_map(&m.gid_mappings),
     })
 }
 

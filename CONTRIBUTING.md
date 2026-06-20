@@ -21,7 +21,9 @@ cargo build              # debug
 cargo build --release    # release (use this for benches)
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test               # 40 unit tests in <1s
+cargo test               # 46 unit tests in <1s
+scripts/oci_validation.sh           # OCI runtime-tools (16/16)
+scripts/bench.sh crun youki runc    # hyperfine comparison
 ```
 
 For IDE support on macOS, point rust-analyzer at the Linux target by

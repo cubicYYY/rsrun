@@ -60,50 +60,66 @@ These don't affect the bench numbers because none of them touch the
 - **Cargo features**: every optional capability gated; default = full
   set, `--no-default-features` produces a 753 KB minimum binary.
 
-## Soon — gaps that affect everyday users
+## Tier 1 — gaps that bite everyday users (4/5 landed)
 
-In rough priority order. See
-[gaps-vs-crun.md](gaps-vs-crun.md) for full context and crun source
-references for each item.
+Items 1-4 below are now in tree. The remaining item is cgroup v1.
+See [gaps-vs-crun.md](gaps-vs-crun.md) for crun source references.
 
-1. **`--preserve-fds`** — pass extra fds into the container init.
-   Used by systemd socket-activation, podman socket injection, some
-   CDI plugins. Currently parsed-and-ignored. ~30 LOC.
+1. ✅ **`--preserve-fds`** — fds 3..N+2 inherited via `fcntl(F_SETFD,
+   !CLOEXEC)` before clone3.
 
-2. **`--no-pivot`** — skip pivot_root, use chroot. Required for
-   read-only rootfs and embedded images. ~20 LOC.
+2. ✅ **`--no-pivot`** — child takes the chroot(2) branch instead of
+   pivot_root + umount.
 
-3. **`process.oomScoreAdj`** — write `/proc/self/oom_score_adj`.
-   Kubernetes sets this per pod QoS class; affects OOM-kill
-   priority under memory pressure. ~10 LOC.
+3. ✅ **`process.oomScoreAdj`** — written to
+   `/proc/<init>/oom_score_adj` from the parent after clone3 returns
+   the host pid.
 
-4. **Hook timeout enforcement** — kill hook subprocess after
+4. ✅ **Idmapped mounts** (`linux.mounts[].uidMappings` /
+   `gidMappings`, kernel 5.12+). Helper task per idmap-mount sets up
+   a userns with the required mapping; parent opens
+   `/proc/<helper>/ns/user` and passes the fd to the child via
+   clone3 fd inheritance; child does
+   `open_tree(OPEN_TREE_CLONE) → mount_setattr(MOUNT_ATTR_IDMAP) →
+   move_mount` on each idmapped entry. Used by Docker 25+ rootless
+   remapping and the K8s user-namespace feature gate.
+
+5. **cgroup v1** — RHEL 8, Amazon Linux 2, older Debian. Deferred:
+   ~600 LOC duplicating cgroup-v2 logic for v1's per-controller
+   layout. Tracked as a separate effort once Tier 2 lands.
+
+## Tier 2 — production-relevant, situational
+
+Items affect real workloads but only under specific configurations.
+
+6. **Hook timeout enforcement** — kill hook subprocess after
    `hooks[i].timeout` seconds. A misbehaving CDI hook currently hangs
    `create` forever. ~15 LOC.
 
-5. **`linux.sysctl` conflict validation** — reject conflicts with the
+7. **`linux.sysctl` conflict validation** — reject conflicts with the
    `hostname` field, namespace-required sysctls without the matching
    namespace, etc. crun does this in the spec parser. ~30 LOC.
 
-6. **`process.consoleSize`** — `TIOCSWINSZ` after PTY allocation. PTY
+8. **`process.consoleSize`** — `TIOCSWINSZ` after PTY allocation. PTY
    currently inherits the kernel default rows × cols. ~10 LOC.
 
-7. **`process.scheduler`** — `SCHED_FIFO` / `SCHED_RR` /
+9. **`process.scheduler`** — `SCHED_FIFO` / `SCHED_RR` /
    `SCHED_DEADLINE` via `sched_setattr(2)`. Realtime workloads,
    K8s latency-sensitive pods. ~50 LOC.
 
-8. **`linux.mountLabel`** propagation — choose `context=` mount
-   option vs `setxattr(security.selinux)` per fstype. SELinux hosts
-   currently see denied access on bind-mounted volumes. ~40 LOC.
+10. **`linux.mountLabel`** propagation — choose `context=` mount
+    option vs `setxattr(security.selinux)` per fstype. SELinux hosts
+    currently see denied access on bind-mounted volumes. ~40 LOC.
 
-9. **Idmapped mounts** (`linux.mounts[].uidMappings` /
-   `gidMappings`, kernel 5.12+) — `mount_setattr(MOUNT_ATTR_IDMAP)`.
-   Used by Docker 25+ rootless remapping and the K8s user-namespace
-   feature gate. ~80 LOC + kernel-version detection.
+11. **`process.rlimits[].soft > hard` validation** — reject at parse
+    time instead of letting the kernel error. ~5 LOC.
 
-10. **cgroup v1** — RHEL 8, Amazon Linux 2, older Debian. ~600 LOC
-    duplicating cgroup-v2 logic for v1's per-controller layout.
-    Diminishing return.
+12. **`tmpcopyup` mount option** — copy directory contents into tmpfs
+    before bind. Used by some K8s ConfigMap / Secret mounts. ~25 LOC.
+
+13. **Recursive mount propagation flags** (`rro`, `rrw`, `rnoexec`,
+    `rsuid` …) via `mount_setattr(MOUNT_ATTR_*, AT_RECURSIVE)`.
+    Linux 5.12+. ~30 LOC.
 
 ## Later
 

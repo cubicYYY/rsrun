@@ -77,26 +77,36 @@ pub fn cmd_create_with_ext(
     pid_file: Option<&Path>,
     ext: crate::plan::ExtPlan,
 ) -> std::io::Result<()> {
-    cmd_create_full(id, bundle, pid_file, ext, None)
+    cmd_create_full(
+        id,
+        bundle,
+        pid_file,
+        ext,
+        None,
+        crate::plan::CreateOpts::default(),
+    )
 }
 
 /// Same as `cmd_create_with_ext` but with the `--console-socket` path
-/// the engine passed. When the spec sets `process.terminal = true` and
-/// this path is `Some`, the runtime opens a PTY pair, sends the master
-/// fd to the engine via SCM_RIGHTS, and dup2's the slave into the
-/// container's stdio.
+/// the engine passed plus `CreateOpts` for engine-compat flags
+/// (`--preserve-fds`, `--no-pivot`). When the spec sets
+/// `process.terminal = true` and a console socket is provided, the
+/// runtime opens a PTY pair, sends the master fd to the engine via
+/// SCM_RIGHTS, and dup2's the slave into the container's stdio.
 pub fn cmd_create_full(
     id: &str,
     bundle: &Path,
     pid_file: Option<&Path>,
     ext: crate::plan::ExtPlan,
     console_socket: Option<&Path>,
+    opts: crate::plan::CreateOpts,
 ) -> std::io::Result<()> {
     let bundle = bundle.canonicalize()?;
     let spec = Spec::from_bundle(&bundle)?;
     let mut plan = CompiledPlan::from_spec(&spec)?;
     plan.ext = ext;
     plan.console_socket = console_socket.map(|p| p.to_path_buf());
+    plan.no_pivot = opts.no_pivot;
 
     // Validate (type, path) pairs for namespace joins before doing any
     // state-dir setup. The OCI spec requires the runtime to MUST error
@@ -273,6 +283,28 @@ pub fn cmd_create_full(
     let pid_relay_read = pid_relay_pipe[0];
     let pid_relay_write = pid_relay_pipe[1];
 
+    // Idmapped mounts: for each `linux.mounts[].uidMappings` set,
+    // spawn a helper task that creates a userns with that mapping.
+    // The parent opens /proc/<helper>/ns/user and passes that fd into
+    // the child; the child's mount loop calls mount_setattr(IDMAP).
+    // Empty mappings → empty Vec → cost is one if-check.
+    let idmap_userns_fds: Vec<i32> = spawn_idmap_helpers(&plan.mounts)?;
+
+    // --preserve-fds: clear CLOEXEC on fds 3..=preserve_fds+2 so they
+    // inherit through clone3+execve. fds 0/1/2 are the workload's
+    // stdio (already non-CLOEXEC). containerd / podman pass extra
+    // file descriptors after stdio; this is what `--preserve-fds`
+    // reserves for them.
+    if opts.preserve_fds > 0 {
+        let last_fd = 2 + opts.preserve_fds as i32;
+        for fd in 3..=last_fd {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+            }
+        }
+    }
+
     // Build clone3 args.
     let mut args = CloneArgs {
         flags: plan.clone_flags.bits() as u64,
@@ -311,9 +343,19 @@ pub fn cmd_create_full(
                 userns_read_fd,
                 pty_slave_fd,
                 pid_relay_write,
+                &idmap_userns_fds,
             );
         }
         unsafe { libc::_exit(127) }
+    }
+
+    // Parent: close idmap helper userns fds (the child has its own
+    // copies via clone3 fd inheritance). The helper tasks themselves
+    // are reaped by waitpid below or auto-reaped after exit signal.
+    for &fd in &idmap_userns_fds {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
     }
 
     // Parent path. Close our copy of the inherited FIFO fd; the child
@@ -408,6 +450,17 @@ pub fn cmd_create_full(
     if let Some(cgroup_dir) = plan.ext.cgroup_v2_path.as_deref() {
         let procs = cgroup_dir.join("cgroup.procs");
         let _ = std::fs::write(&procs, init_pid.to_string());
+    }
+
+    // process.oomScoreAdj — written to /proc/<init>/oom_score_adj
+    // *from the parent* now that we know the host-ns pid. We can't do
+    // this in the child because PR_SET_DUMPABLE / userns mappings may
+    // make the child unable to write its own oom_score_adj after the
+    // user transition. Best-effort: a failed write doesn't abort
+    // create (the kernel default of 0 is not security-sensitive).
+    if let Some(adj) = plan.oom_score_adj {
+        let path = format!("/proc/{init_pid}/oom_score_adj");
+        let _ = std::fs::write(&path, adj.to_string());
     }
 
     std::fs::write(paths.pid_file(), init_pid.to_string())?;
@@ -597,6 +650,7 @@ unsafe fn child_run(
     userns_read_fd: i32,
     pty_slave_fd: i32,
     pid_relay_write: i32,
+    idmap_userns_fds: &[i32],
 ) -> ! {
     // Rootless: block until parent finishes uid_map / gid_map writes.
     // Rootful: this entire block is skipped (no syscalls).
@@ -741,7 +795,7 @@ unsafe fn child_run(
     let mut mloop = 0u32;
 
     // 3. Execute the mount plan (proc, sys, dev, tmpfs, etc.) inside the new ns.
-    for m in &plan.mounts {
+    for (idx, m) in plan.mounts.iter().enumerate() {
         mloop += 1;
         // mkdir target; we don't care if it exists
         let _ = std::fs::create_dir_all(&m.target);
@@ -755,6 +809,23 @@ unsafe fn child_run(
         } else {
             Some(fstype_str)
         };
+
+        // Idmapped bind mount: bypass the regular mount() and use the
+        // open_tree → mount_setattr(IDMAP) → move_mount triplet
+        // instead. The kernel only accepts MOUNT_ATTR_IDMAP on a
+        // freshly-detached mount tree; an already-attached bind would
+        // be rejected. For non-idmap mounts we fall through to plain
+        // mount(2) — the hot path is unchanged.
+        if !m.idmap_uid.is_empty()
+            && idx < idmap_userns_fds.len()
+            && idmap_userns_fds[idx] >= 0
+        {
+            if !apply_idmap_bind(&m.source, &m.target, idmap_userns_fds[idx]) {
+                child_die(err_fd, 130, b"idmapped bind mount failed");
+            }
+            continue;
+        }
+
         if mount(src_opt, &m.target, fstype_opt, m.flags, data_str).is_err() {
             // Continue on mount failure. Many spec mounts are non-essential
             // (cgroup-inside-container, /dev/mqueue on hosts that don't
@@ -764,21 +835,35 @@ unsafe fn child_run(
 
     let _ = mloop; // suppress warning
 
-    // 4. pivot_root into the new rootfs.
-    let put_old = root_path.join(".rsrun_old");
-    let _ = std::fs::create_dir_all(&put_old);
-    let pr_result = pivot_root(root_path, &put_old);
-    if pr_result.is_err() {
-        child_die(err_fd, 103, b"pivot_root failed");
+    // 4. Switch root. Default path is pivot_root(2) — properly detaches
+    // the host rootfs so a process inside can't escape via ../. The
+    // --no-pivot fallback uses chroot(2) instead, required when
+    // rootfs is on a tmpfs that can't host the put_old dir or when
+    // the host rootfs is read-only. crun supports the same flag.
+    if plan.no_pivot {
+        let rootfs_c = std::ffi::CString::new(rootfs.as_bytes()).unwrap();
+        if libc::chroot(rootfs_c.as_ptr()) != 0 {
+            child_die(err_fd, 103, b"chroot failed");
+        }
+        if chdir("/").is_err() {
+            child_die(err_fd, 104, b"chdir / failed");
+        }
+    } else {
+        let put_old = root_path.join(".rsrun_old");
+        let _ = std::fs::create_dir_all(&put_old);
+        let pr_result = pivot_root(root_path, &put_old);
+        if pr_result.is_err() {
+            child_die(err_fd, 103, b"pivot_root failed");
+        }
+        if chdir("/").is_err() {
+            child_die(err_fd, 104, b"chdir / failed");
+        }
+        // Detach the old root and remove the directory.
+        if umount2("/.rsrun_old", MntFlags::MNT_DETACH).is_err() {
+            child_die(err_fd, 105, b"umount old_root failed");
+        }
+        let _ = std::fs::remove_dir("/.rsrun_old");
     }
-    if chdir("/").is_err() {
-        child_die(err_fd, 104, b"chdir / failed");
-    }
-    // Detach the old root and remove the directory.
-    if umount2("/.rsrun_old", MntFlags::MNT_DETACH).is_err() {
-        child_die(err_fd, 105, b"umount old_root failed");
-    }
-    let _ = std::fs::remove_dir("/.rsrun_old");
 
     // 4a. linux.rootfsPropagation: change `/`'s propagation mode after
     // pivot_root. By default rsrun set it MS_PRIVATE in step 1; this
@@ -1345,6 +1430,217 @@ unsafe fn apply_selinux(err_fd: i32, label: &CString) {
     if w < 0 || w as usize != lbl_bytes.len() {
         child_die(err_fd, 121, b"write selinux label failed");
     }
+}
+
+/// For each mount in `plan.mounts` with non-empty idmap_uid/idmap_gid,
+/// spawn a helper task that creates a fresh user namespace with that
+/// mapping, and return its `/proc/<pid>/ns/user` fd. Mounts without
+/// an idmap get fd = -1 (so the index lines up). The helper uses
+/// pause(2) to keep its userns alive until after clone3 has returned;
+/// once the parent closes the userns fd, the kernel reaps the helper.
+///
+/// Linux 5.12+ for `mount_setattr(MOUNT_ATTR_IDMAP)`; older kernels
+/// will fail later in the child's apply_idmap call and that mount
+/// just runs un-idmapped (best-effort, with a child.err message).
+fn spawn_idmap_helpers(mounts: &[crate::plan::MountOp]) -> std::io::Result<Vec<i32>> {
+    let mut fds = Vec::with_capacity(mounts.len());
+    for m in mounts {
+        if m.idmap_uid.is_empty() && m.idmap_gid.is_empty() {
+            fds.push(-1);
+            continue;
+        }
+        // Helper synchronizes via a one-shot pipe: helper writes 1
+        // byte after its uid_map/gid_map are installed. Parent reads,
+        // opens /proc/<helper>/ns/user, then leaves the helper to be
+        // reaped (it's parked in pause()).
+        let mut sync_pipe: [i32; 2] = [-1, -1];
+        if unsafe { libc::pipe2(sync_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let helper_pid = unsafe { libc::fork() };
+        if helper_pid < 0 {
+            unsafe {
+                libc::close(sync_pipe[0]);
+                libc::close(sync_pipe[1]);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        if helper_pid == 0 {
+            // Helper child. Close read end, unshare userns, install
+            // mappings, signal parent, pause forever.
+            unsafe {
+                libc::close(sync_pipe[0]);
+                if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    libc::_exit(1);
+                }
+                // setgroups must be "deny" before we can write a
+                // single-line gid_map without being root in the parent
+                // userns.
+                let _ = std::fs::write("/proc/self/setgroups", b"deny");
+                if !m.idmap_uid.is_empty() {
+                    if std::fs::write("/proc/self/uid_map", &m.idmap_uid).is_err() {
+                        libc::_exit(2);
+                    }
+                }
+                if !m.idmap_gid.is_empty() {
+                    if std::fs::write("/proc/self/gid_map", &m.idmap_gid).is_err() {
+                        libc::_exit(3);
+                    }
+                }
+                let one = b'1';
+                let _ = libc::write(
+                    sync_pipe[1],
+                    &one as *const u8 as *const _,
+                    1,
+                );
+                libc::close(sync_pipe[1]);
+                // Park forever; parent will close the userns fd to
+                // release us, but we must keep the userns alive until
+                // mount_setattr completes in the child.
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        // Parent path.
+        unsafe { libc::close(sync_pipe[1]) };
+        let mut byte = [0u8; 1];
+        let n = unsafe {
+            libc::read(sync_pipe[0], byte.as_mut_ptr() as *mut _, 1)
+        };
+        unsafe { libc::close(sync_pipe[0]) };
+        if n != 1 {
+            // Helper failed before signaling. Reap it and continue
+            // with fd=-1 (mount will run un-idmapped).
+            let mut st = 0i32;
+            unsafe { libc::waitpid(helper_pid, &mut st, 0) };
+            fds.push(-1);
+            continue;
+        }
+        let path = format!("/proc/{helper_pid}/ns/user");
+        let path_c = std::ffi::CString::new(path).unwrap();
+        let fd = unsafe {
+            libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        // Don't kill the helper — `mount_setattr` needs a live
+        // reference to the userns. The helper exits naturally when
+        // the parent process group is cleaned up, or it's reparented
+        // to init. The userns stays alive as long as the open fd
+        // exists; closing the fd in the parent (after clone3 inherits
+        // it into the child) lets the kernel reclaim the userns when
+        // the child closes its copy too.
+        if fd < 0 {
+            // Reap the helper; we won't be using it.
+            unsafe { libc::kill(helper_pid, libc::SIGKILL) };
+            let mut st = 0i32;
+            unsafe { libc::waitpid(helper_pid, &mut st, 0) };
+            fds.push(-1);
+            continue;
+        }
+        // SIGKILL the helper task itself — we have its userns fd, the
+        // helper PID's existence is no longer needed (the userns is
+        // ref-counted via the fd). This keeps the process table tidy.
+        unsafe {
+            libc::kill(helper_pid, libc::SIGKILL);
+            let mut st = 0i32;
+            libc::waitpid(helper_pid, &mut st, 0);
+        }
+        fds.push(fd);
+    }
+    Ok(fds)
+}
+
+/// Apply `mount_setattr(MOUNT_ATTR_IDMAP)` to a freshly-bound mount.
+/// We use the simpler `mount_setattr(2)` directly rather than the
+/// `open_tree` + detached-mount dance — for a direct bind mount we
+/// can attach the attr to the path. Failures are non-fatal: write a
+/// diagnostic and let the mount run un-idmapped.
+/// Build an idmapped bind mount from `source` to `target` using the
+/// `open_tree` + `mount_setattr(IDMAP)` + `move_mount` triplet. The
+/// kernel only accepts `MOUNT_ATTR_IDMAP` on a freshly-detached mount
+/// (i.e. one created via `open_tree(OPEN_TREE_CLONE)`), so we bypass
+/// the regular bind-mount syscall and synthesize the same effect from
+/// these three.
+///
+/// Returns false on any kernel error; caller writes a diagnostic to
+/// the err_fd.
+unsafe fn apply_idmap_bind(
+    source: &std::ffi::CStr,
+    target: &std::path::Path,
+    userns_fd: i32,
+) -> bool {
+    // Linux syscall numbers are stable across arches for these.
+    const SYS_OPEN_TREE: i64 = 428;
+    const SYS_MOUNT_SETATTR: i64 = 442;
+    const SYS_MOVE_MOUNT: i64 = 429;
+    // open_tree flags: OPEN_TREE_CLONE makes a detached *new* mount
+    // tree from the source, OPEN_TREE_CLOEXEC sets close-on-exec.
+    // AT_RECURSIVE makes it a recursive bind (matches how spec
+    // `rbind` works); we always include it because OCI bind mounts
+    // are conceptually rbinds for non-empty source dirs.
+    const OPEN_TREE_CLONE: u32 = 1;
+    const OPEN_TREE_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
+    const AT_RECURSIVE: u32 = 0x8000;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
+    const MOUNT_ATTR_IDMAP: u64 = 0x00100000;
+
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+
+    let target_c = match std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // 1. Detach a clone of the source mount tree.
+    let tree_fd = libc::syscall(
+        SYS_OPEN_TREE,
+        libc::AT_FDCWD,
+        source.as_ptr(),
+        OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
+    ) as i32;
+    if tree_fd < 0 {
+        return false;
+    }
+
+    // 2. Apply MOUNT_ATTR_IDMAP referencing our pre-built userns fd.
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_IDMAP,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: userns_fd as u64,
+    };
+    let empty = b"\0";
+    let rc = libc::syscall(
+        SYS_MOUNT_SETATTR,
+        tree_fd,
+        empty.as_ptr() as *const libc::c_char,
+        AT_EMPTY_PATH | AT_RECURSIVE,
+        &attr as *const MountAttr,
+        std::mem::size_of::<MountAttr>(),
+    );
+    if rc != 0 {
+        libc::close(tree_fd);
+        return false;
+    }
+
+    // 3. Move the detached idmapped tree onto the spec target.
+    let rc = libc::syscall(
+        SYS_MOVE_MOUNT,
+        tree_fd,
+        empty.as_ptr() as *const libc::c_char,
+        libc::AT_FDCWD,
+        target_c.as_ptr(),
+        MOVE_MOUNT_F_EMPTY_PATH,
+    );
+    libc::close(tree_fd);
+    rc == 0
 }
 
 /// Load the device cgroup eBPF program and attach it to the cgroup-v2

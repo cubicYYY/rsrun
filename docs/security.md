@@ -11,18 +11,38 @@ rsrun assumes:
   `config.json` and rootfs in place has authority to run the workload
   with the privileges the spec requests.
 - **The kernel is current.** rsrun relies on kernel-level mitigations
-  like `deny_write_access` during `execve`.
+  like `deny_write_access` during `execve` and `MOUNT_ATTR_IDMAP`
+  (Linux ≥ 5.12 for idmapped mounts).
 
-rsrun does **not** currently defend against:
+What rsrun applies when the bundle requests it:
 
-- A malicious workload trying to escape via seccomp-permitted syscalls.
-  rsrun does not load a seccomp filter.
-- A malicious workload trying to escape via AppArmor/SELinux gaps.
-  rsrun does not apply LSM profiles.
-- OCI hook misconfiguration. rsrun does not run hooks.
+- **seccomp** — `linux.seccomp` profile compiled and installed via
+  `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)` before exec.
+- **AppArmor / SELinux** — `process.apparmorProfile` /
+  `process.selinuxLabel` staged via `/proc/self/attr/...`. rsrun
+  hard-fails on a missing profile rather than silently running
+  unconfined.
+- **Device cgroup BPF** — `linux.resources.devices` rules compiled
+  to a `BPF_PROG_TYPE_CGROUP_DEVICE` program and attached to the
+  cgroup-v2 directory.
+- **OCI hooks** — all six phases (`prestart`, `createRuntime`,
+  `createContainer`, `startContainer`, `poststart`, `poststop`).
+  In-container hooks (`createContainer`, `startContainer`) inherit
+  the seccomp filter installed earlier in the child path.
 
-These are tracked as future work. Until then, do not run untrusted
-workloads under rsrun without an additional sandbox layer.
+What rsrun **does not** yet defend against:
+
+- Custom seccomp **argument matching** (per-syscall `args`). rsrun
+  does allowlist-by-name only; an attacker can still call any
+  whitelisted syscall with arbitrary arguments.
+- AppArmor profile **stacking** (`change_profile` for
+  container-in-container). rsrun does `change_onexec` only.
+- Hook **timeouts** are parsed but not enforced — a runaway hook
+  hangs `create`. Do not run untrusted bundles with hooks until this
+  lands.
+
+The full feature gap audit is in
+[gaps-vs-crun.md](gaps-vs-crun.md).
 
 ## CVE-2019-5736
 

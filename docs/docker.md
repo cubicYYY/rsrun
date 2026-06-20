@@ -1,7 +1,7 @@
 # Using rsrun as a Docker runtime
 
-Yes — on cgroup-v2 hosts with Docker configured for the cgroupfs
-driver, `docker run --runtime=rsrun ...` works end-to-end. Read
+Yes — `docker run --runtime=rsrun ...` works end-to-end on cgroup-v2
+hosts with either the `cgroupfs` or `systemd` cgroup driver. Read
 [Compatibility checklist](#compatibility-checklist) before pointing
 production traffic at it.
 
@@ -42,7 +42,9 @@ rsrun handles this layer in `crates/rsrun/src/main.rs`:
 - `--log-format json` switches stderr to
   `{"level":"error","time":"...","msg":"..."}` line format that
   containerd's shim parses.
-- `--systemd-cgroup`, `--rootless`, `--debug` are accepted (no-op).
+- `--systemd-cgroup` switches the cgroup driver from cgroupfs to a
+  transient systemd `.scope` slice (via `systemd-run`).
+- `--rootless`, `--debug` are accepted (no-op).
 - `kill <id>` without an explicit signal (e.g. `docker stop`) defaults
   to `SIGTERM`.
 - `features` returns the JSON descriptor Docker queries at registration
@@ -79,30 +81,11 @@ If your host fails any of these, rsrun won't be a drop-in for
 | Check | rsrun support |
 |-------|---------------|
 | Kernel ≥ 5.x with cgroup v2 unified hierarchy | required |
-| Docker daemon configured with `native.cgroupdriver=cgroupfs` | required |
 | `BPF_PROG_TYPE_CGROUP_DEVICE` available (kernel ≥ 4.15) | required |
 | AppArmor / SELinux profile if your daemon enforces one | works |
 | Custom seccomp profile JSON | works |
-
-The two big ones in practice:
-
-### Cgroup driver: cgroupfs vs systemd
-
-Most modern distros' `dockerd.service` is configured with
-`native.cgroupdriver=systemd`. **rsrun does not implement the systemd
-driver yet** — `--systemd-cgroup` is parsed and ignored, and rsrun
-writes cgroupfs directly under `/sys/fs/cgroup/rsrun-<id>/`. Effects:
-
-- The container's cgroup is *not* a systemd transient `.scope`, so it
-  does not appear in `systemctl status` and is not subject to systemd's
-  OOM/resource policy at the slice level.
-- On a host where Docker is otherwise running with `cgroupdriver=systemd`,
-  using `--runtime=rsrun` for one container will make that container's
-  accounting diverge from the rest.
-
-To use rsrun cleanly, set `"exec-opts": ["native.cgroupdriver=cgroupfs"]`
-in `daemon.json` and restart Docker. Or wait for the systemd-cgroup
-driver in rsrun (on the roadmap).
+| Either `cgroupdriver=cgroupfs` or `cgroupdriver=systemd` | works |
+| Idmapped mounts (Docker 25+ rootless remap) | kernel ≥ 5.12 |
 
 ### Cgroup version: v1 vs v2
 
@@ -119,22 +102,14 @@ roadmap, lower priority).
 
 ## Known limitations
 
-- **No `pause` / `resume`.** `docker pause` on an rsrun container
-  errors out (rsrun doesn't implement the `pause` verb yet).
-- **`docker update` doesn't take effect.** rsrun has no `update` verb;
-  cgroup limits set at create are sticky.
-- **`docker stats`** shows zeros for some columns (rsrun has no
-  `events`/`stats` verbs that stream cgroup metrics — Docker falls
-  back to reading cgroupfs itself, which works for memory.current but
-  not for cpu rates).
-- **`docker checkpoint` / `docker restore`** unsupported (no CRIU).
-- **`docker exec --tty --interactive`** works for stdin/stdout, but the
-  exec'd process inherits the rsrun-side PTY rather than getting its
-  own — running `tput`/`top` inside an exec session may misbehave.
-- **OCI hooks defined by the engine** (e.g. CDI device hooks injected
-  by containerd) fire correctly. Hooks defined in `~/.docker/config.json`
-  via `runtime.<name>.runtimeArgs` do *not* — Docker doesn't pass them
-  through.
+- **`docker checkpoint` / `docker restore`** unsupported (no CRIU
+  integration).
+- **Hook timeout enforcement** — a runaway OCI hook will hang
+  `docker run` indefinitely. Don't run untrusted bundles with hooks.
+- **OCI hooks from `~/.docker/config.json`** via
+  `runtime.<name>.runtimeArgs` are not passed through by Docker.
+  Hooks on the bundle's `config.json` (which is what containerd /
+  CDI-using engines write) fire correctly.
 
 ## Quick smoke test
 

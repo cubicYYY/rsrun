@@ -42,6 +42,9 @@ pub struct Spec {
     /// "unbindable" (or recursive `r*` variants). Applied to `/` after
     /// pivot_root. None = leave at MS_PRIVATE (rsrun's default).
     pub rootfs_propagation: Option<String>,
+    /// process.oomScoreAdj: -1000..=1000. Written to
+    /// /proc/<init>/oom_score_adj from the parent after clone3.
+    pub oom_score_adj: Option<i32>,
     /// linux.maskedPaths: bind-mount /dev/null over each (file) or
     /// remount tmpfs RDONLY over each (dir).
     pub masked_paths: Vec<String>,
@@ -130,6 +133,13 @@ pub struct MountSpec {
     pub source: String,
     pub fstype: String,
     pub options: Vec<String>,
+    /// `linux.mounts[].uidMappings` and `gidMappings` — the OCI
+    /// idmapped-mount feature. Empty = no idmap. When set, the
+    /// runtime spawns a helper task with these mappings, opens its
+    /// user-ns fd, and applies `mount_setattr(MOUNT_ATTR_IDMAP)` to
+    /// the mount post-bind. Linux 5.12+.
+    pub uid_mappings: Vec<IdMapping>,
+    pub gid_mappings: Vec<IdMapping>,
 }
 
 impl Spec {
@@ -164,6 +174,10 @@ impl Spec {
             .get("noNewPrivileges")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let oom_score_adj = process
+            .get("oomScoreAdj")
+            .and_then(Value::as_i64)
+            .map(|n| n as i32);
         let apparmor_profile = process
             .get("apparmorProfile")
             .and_then(Value::as_str)
@@ -317,11 +331,19 @@ impl Spec {
                     .get("options")
                     .map(string_array)
                     .unwrap_or_default();
+                let parse_maps = |key: &str| -> Vec<IdMapping> {
+                    m.get(key)
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(parse_mapping).collect())
+                        .unwrap_or_default()
+                };
                 mounts.push(MountSpec {
                     destination,
                     source,
                     fstype,
                     options,
+                    uid_mappings: parse_maps("uidMappings"),
+                    gid_mappings: parse_maps("gidMappings"),
                 });
             }
         }
@@ -351,6 +373,7 @@ impl Spec {
             selinux_label,
             sysctls,
             rootfs_propagation,
+            oom_score_adj,
             raw: v,
             bundle: bundle.to_path_buf(),
         })

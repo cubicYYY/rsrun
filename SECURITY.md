@@ -23,8 +23,5 @@ In scope:
 - Denial-of-service against the host from a container the runtime
   was used to launch
 
-Out of scope (today):
-
-- Workload-level isolation gaps that come from features rsrun does
-  not yet implement (seccomp, AppArmor, SELinux, OCI hooks). See
-  [docs/security.md](docs/security.md) for the current threat model.
+For the current threat model and what rsrun actively defends against,
+see [docs/security.md](docs/security.md).

@@ -120,11 +120,9 @@ area of v2. We chose to skip it and document the gap.
 on the kernel command line. Workaround for those users: don't use
 rsrun yet, or boot with `systemd.unified_cgroup_hierarchy=1`.
 
-**What we still don't do (even on v2):** the systemd cgroup driver
-(D-Bus to systemd to create transient `.scope` slices). We write
-cgroupfs directly, which is correct on systems where the rsrun cgroup
-isn't owned by systemd. On full-systemd hosts this puts the container
-outside `systemctl status` reach.
+**Driver choice:** on `--systemd-cgroup` we shell out to
+`systemd-run` (see the dedicated section below). Without the flag we
+write cgroupfs directly. Both are supported.
 
 ---
 
@@ -279,10 +277,76 @@ For `exec` we call them with `err_fd = 2` (stderr) — they write a
 diagnostic to stderr and `_exit` on failure. Same code, different
 error channel.
 
-**What we still don't do in exec:** no `--console-socket` PTY for
-`-it`, no `--detach` PID race-free guarantee, no per-exec seccomp
-override, no `--apparmor` flag override (the spec'd profile in
-`process.json` is what's used). All on the roadmap.
+**`--console-socket`** is now also wired into `cmd_exec`: when
+`process.json` sets `terminal: true` and the engine passes a console
+socket, the parent allocates a PTY pair, sends the master fd via
+SCM_RIGHTS, and the exec'd child takes the slave as its controlling
+terminal. Same `send_pty_master` helper as `create`.
+
+**What we still don't do in exec:** no per-exec seccomp override
+(the container's installed filter applies), no `--apparmor` /
+`--cap` CLI flag override (the spec'd profile in `process.json` is
+what's used), no race-free `--detach` PID guarantee. On the roadmap.
+
+---
+
+## systemd cgroup driver
+
+**The choice:** shell out to `systemd-run --scope` (~25 LOC) instead
+of pulling in `zbus` (~50 transitive crates, ~5 MB compile cost) for
+a single D-Bus method call.
+
+**Cost:** one fork+exec on `create` *only when `--systemd-cgroup` is
+set*. Default rsrun is unaffected. crun does its own D-Bus
+marshalling but that's ~400 LOC.
+
+**Trade-off:** we depend on `systemd-run` being on PATH. On any host
+where Docker would be configured for `cgroupdriver=systemd`, it is.
+On hosts where it isn't, the user gets `cgroupfs` mode anyway —
+which is what they would have wanted.
+
+---
+
+## Idmapped mounts
+
+**Spec:** `linux.mounts[].uidMappings` / `gidMappings` (kernel ≥ 5.12)
+remap file ownership per-mount without a separate user namespace.
+
+**Kernel constraint:** `MOUNT_ATTR_IDMAP` requires a userns fd —
+referencing the mapping — *and* requires the mount to be a freshly-
+detached tree (i.e. `open_tree(OPEN_TREE_CLONE)`), not an already-
+attached bind. The regular `mount(MS_BIND)` path doesn't work.
+
+**Solution:** for each idmapped mount the parent forks a helper
+task that `unshare(CLONE_NEWUSER)`s, writes the requested
+`uid_map`/`gid_map`, signals the parent, and pauses. The parent
+opens `/proc/<helper>/ns/user`, kills the helper (the userns stays
+alive because the fd holds a reference), and passes the fd into the
+container child via clone3 inheritance. The child's mount loop calls
+the `open_tree` → `mount_setattr(MOUNT_ATTR_IDMAP)` → `move_mount`
+triplet for each idmapped entry.
+
+**Trade-off:** one extra fork+kill per idmapped mount, paid only on
+bundles that use the feature. Hot path unchanged.
+
+---
+
+## --preserve-fds, --no-pivot, oomScoreAdj
+
+Three small Tier-1 engine-compat flags, all opt-in:
+
+- **`--preserve-fds N`** — the parent walks fds `3..=N+2` and clears
+  `FD_CLOEXEC`. clone3+execve then inherit them into the workload.
+  Used by systemd socket-activation and podman's pre-bound listener
+  injection.
+- **`--no-pivot`** — child takes the `chroot(2) + chdir("/")` branch
+  instead of the default `pivot_root + umount2(MNT_DETACH)`. Required
+  for read-only rootfs setups where pivot_root would fail. The
+  pivot_root path is the safer default; chroot is the fallback.
+- **`process.oomScoreAdj`** — written from the *parent* to
+  `/proc/<init>/oom_score_adj` after clone3 returns. Doing it in the
+  child would fail post-userns under PR_SET_DUMPABLE=0 (the child
+  can't write its own /proc files).
 
 ---
 
@@ -293,9 +357,6 @@ themes:
 
 - **cgroup v1**: not worth the surface area for the shrinking install
   base. v2 only.
-- **systemd cgroup driver**: the right answer for podman/containerd on
-  full-systemd hosts. We need it before any "production-ready"
-  positioning, but it's a D-Bus dependency we haven't paid yet.
 - **CRIU checkpoint/restore**: complex, niche, and the userland surface
   is large. crun's wrapper is ~1500 LOC.
 - **WASM workloads**: youki has it. We don't. Out of scope for v0.

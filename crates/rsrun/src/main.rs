@@ -51,12 +51,15 @@ enum Cmd {
         /// Used when the bundle sets `process.terminal: true`.
         #[arg(long = "console-socket")]
         console_socket: Option<PathBuf>,
-        /// Accepted, ignored.
+        /// Pass extra file descriptors 3..=N+2 into the container's
+        /// init. Used by systemd socket-activation and by engines
+        /// that pre-bind listening sockets.
         #[arg(long = "preserve-fds")]
-        _preserve_fds: Option<String>,
-        /// Accepted, ignored. rsrun always uses pivot_root.
+        preserve_fds: Option<u32>,
+        /// Use chroot(2) instead of pivot_root(2). Required for
+        /// read-only rootfs setups where pivot_root would fail.
         #[arg(long = "no-pivot")]
-        _no_pivot: bool,
+        no_pivot: bool,
         id: String,
     },
     /// Unblock the created container; the workload begins running.
@@ -174,9 +177,21 @@ fn main() -> ExitCode {
     }
 
     let res: std::io::Result<()> = match cli.cmd {
-        Cmd::Create { bundle, pid_file, console_socket, id, .. } => {
-            create_with_ext(&id, &bundle, pid_file.as_deref(), console_socket.as_deref())
-        }
+        Cmd::Create {
+            bundle,
+            pid_file,
+            console_socket,
+            preserve_fds,
+            no_pivot,
+            id,
+        } => create_with_ext(
+            &id,
+            &bundle,
+            pid_file.as_deref(),
+            console_socket.as_deref(),
+            preserve_fds.unwrap_or(0),
+            no_pivot,
+        ),
         Cmd::Start { id } => runtime::cmd_start(&id),
         Cmd::Delete { force, id } => runtime::cmd_delete(&id, force),
         Cmd::State { id } => runtime::cmd_state(&id),
@@ -270,9 +285,15 @@ fn create_with_ext(
     bundle: &std::path::Path,
     pid_file: Option<&std::path::Path>,
     console_socket: Option<&std::path::Path>,
+    preserve_fds: u32,
+    no_pivot: bool,
 ) -> std::io::Result<()> {
     let canonical = bundle.canonicalize()?;
     let spec = rsrun_core::spec::Spec::from_bundle(&canonical)?;
     let ext = rsrun_ext::compile(&spec, id)?;
-    runtime::cmd_create_full(id, bundle, pid_file, ext, console_socket)
+    let opts = rsrun_core::plan::CreateOpts {
+        preserve_fds,
+        no_pivot,
+    };
+    runtime::cmd_create_full(id, bundle, pid_file, ext, console_socket, opts)
 }

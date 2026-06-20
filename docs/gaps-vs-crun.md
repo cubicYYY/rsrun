@@ -11,39 +11,32 @@ see [oci-compliance.md](oci-compliance.md).
 
 ## Tier 1 — likely to bite real workloads
 
-These show up under everyday `docker run` / `podman run` /
-Kubernetes-with-containerd flows.
+Most of this tier has now landed. The remaining gap is cgroup v1.
 
-### `--preserve-fds <N>`
+### `--preserve-fds <N>` ✅ landed
 - **crun**: `src/run.c:50`, `src/exec.c:81`
-- **What**: pass N additional file descriptors (3..N+2) into the
-  container. Used by systemd socket-activation, by `podman` to inject
-  pre-bound listening sockets, and by some CDI device plugins.
-- **rsrun**: argv accepted, value ignored. Engines that hand fds in
-  this way will see them silently dropped.
+- **rsrun**: marks fds 3..N+2 non-CLOEXEC in the parent before
+  clone3 so they inherit into the container init.
 
-### `--no-pivot`
+### `--no-pivot` ✅ landed
 - **crun**: `src/run.c:55`, `src/create.c:45`
-- **What**: skip `pivot_root(2)`, use `chroot(2)` instead. Required for
-  read-only rootfs setups (e.g. some embedded / appliance images) and
-  for Docker's `--read-only` flag in certain configurations.
-- **rsrun**: argv accepted, ignored — rsrun always pivot_roots.
+- **rsrun**: child uses `chroot(2)` + `chdir("/")` instead of the
+  default `pivot_root(2)` + `umount2(MNT_DETACH)` path.
 
-### Idmapped mounts (`mountExtensions.idmap`)
+### Idmapped mounts (`linux.mounts[].uidMappings` / `gidMappings`) ✅ landed
 - **crun**: `src/libcrun/linux.c:4413`, `linux.c:328`
-- **What**: maps uid/gid ranges per-mount via `mount_setattr(2)`. Used
-  by Docker 25+ for rootless remapping, by Kubernetes' user-namespace
-  feature gate. OCI field: `linux.mounts[].uidMappings` /
-  `gidMappings`. Available since kernel 5.12.
-- **rsrun**: not implemented — `linux.mounts[].uidMappings` is parsed
-  but the `mount_setattr` call is missing.
+- **rsrun**: per idmapped mount, the parent forks a helper task that
+  unshares a userns and writes the requested uid_map/gid_map into it;
+  the parent opens `/proc/<helper>/ns/user` and passes the fd into
+  the child via clone3 fd inheritance; the child's mount loop runs
+  `open_tree(OPEN_TREE_CLONE)` on the source, applies
+  `mount_setattr(MOUNT_ATTR_IDMAP)` with the userns fd, then
+  `move_mount`s the detached tree onto the spec target. Linux 5.12+.
 
-### `process.oomScoreAdj`
+### `process.oomScoreAdj` ✅ landed
 - **crun**: `src/libcrun/linux.c:3636`
-- **What**: writes `/proc/self/oom_score_adj` so the container's init
-  has a tunable OOM-kill priority. Kubernetes sets this per pod QoS
-  class (Guaranteed = -997, Burstable = depends, BestEffort = +1000).
-- **rsrun**: parsed-but-ignored. Affects K8s OOM behavior on pressure.
+- **rsrun**: written to `/proc/<init_pid>/oom_score_adj` from the
+  parent after clone3 returns the host-ns pid.
 
 ### cgroup v1
 - **crun**: `src/libcrun/cgroup-resources.c:1202` and the v1 subsystem

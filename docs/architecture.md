@@ -16,16 +16,23 @@ rsrun/
 ```
 
 - **`rsrun-core`** holds the syscall-floor lifecycle: `clone3`,
-  namespaces, mounts, `pivot_root`, capabilities, rlimits, default
-  `/dev`, `noNewPrivileges`, `process.user`, `linux.namespaces[].path`
-  joining, basic `exec`. The hot-path benchmark numbers all live here.
-- **`rsrun-ext`** holds features used only by the standalone `rsrun`
-  CLI: seccomp profile compilation, cgroup-v2 limits, OCI hooks,
-  `linux.devices` parsing. Each is opt-in: an empty `ExtPlan` makes
-  core skip the corresponding install step.
+  namespaces, mounts, `pivot_root`/`chroot`, capabilities, rlimits,
+  default `/dev`, LSM staging, `noNewPrivileges`, `process.user`,
+  `linux.sysctl`, idmapped mounts, the full `exec` verb, and the
+  `pause` / `resume` / `update` / `stats` / `events` verbs.
+- **`rsrun-ext`** holds the spec → plan compilation that pulls in
+  external crates: seccomp (`seccompiler`), cgroup-v2 knob writes,
+  OCI hooks, the eBPF emitter for `linux.resources.devices`. Each is
+  a Cargo feature; an empty `ExtPlan` makes core skip the
+  corresponding install step.
 - **`rsrun` (bin)** orchestrates: parse argv, load the spec, ask
   `rsrun-ext` to build an `ExtPlan` from the spec extras, hand it to
-  `rsrun-core::cmd_create_with_ext`.
+  `rsrun-core::cmd_create_full`.
+
+Every optional capability is a default-on Cargo feature — see the
+"Feature flags" table in [README.md](../README.md). Building with
+`--no-default-features` produces a 753 KB binary that just does the
+lifecycle.
 
 The future `rsrund` daemon depends only on `rsrun-core` and passes
 `ExtPlan::default()` to skip the heavy work — its trust model
@@ -112,36 +119,23 @@ stays at one fork.
 
 The OCI spec is JSON; the kernel takes flags, bitmasks, and
 null-terminated C strings. rsrun does that translation **once, in the
-parent**, into a flat struct:
+parent**, into a flat struct (`crates/rsrun-core/src/plan.rs`):
 
-```rust
-pub struct CompiledPlan {
-    pub clone_flags: CloneFlags,       // ready for clone3
-    pub wants_userns: bool,
-    pub uid_map_data: Vec<u8>,         // pre-formatted "0 1000 1\n"
-    pub gid_map_data: Vec<u8>,
-    pub hostname: CString,
-    pub root_path: PathBuf,
-    pub root_readonly: bool,
-    pub mounts: Vec<MountOp>,          // each with parsed MsFlags
-    pub argv: Vec<CString>,
-    pub envp: Vec<CString>,
-    pub cwd: CString,
-    pub rlimits: Vec<(__rlimit_resource_t, rlimit64)>,
-    pub caps: Option<CapBitmasks>,     // 5 u64 bitmasks
-    pub no_new_privileges: bool,
-    pub default_devices: Vec<DefaultDevice>,
-    pub default_symlinks: Vec<(CString, CString)>,
-    pub masked_paths: Vec<CString>,
-    pub readonly_paths: Vec<CString>,
-    pub user_uid: u32,
-    pub user_gid: u32,
-    pub user_additional_gids: Vec<u32>,
-    pub user_umask: Option<u32>,
-}
-```
+- Namespace flags pre-OR'd for `clone3`, with `wants_userns` so the
+  rootless path is a single predicted-not-taken branch.
+- uid_map / gid_map already formatted as line buffers.
+- `MountOp` per spec mount with `MsFlags` parsed and `data` as a
+  pre-built `CString`; idmap mappings pre-formatted per mount.
+- argv / envp / cwd as `Vec<CString>`.
+- Capability bitmasks (5 `u64`), rlimits as `(resource, rlimit64)`
+  pairs.
+- Default `/dev` device + symlink lists as `CString`s.
+- LSM stage strings (AppArmor profile, SELinux label) as `CString`s.
+- `linux.sysctl` writes pre-resolved to `(/proc/sys/<path>, value)`.
+- `ExtPlan` opt-in payload: seccomp BPF, cgroup-v2 knob writes, hooks,
+  device cgroup eBPF.
 
-After `clone3`, the child path treats `Plan` as read-only and avoids
+After `clone3`, the child path treats the plan as read-only and avoids
 the heap. Everything is a syscall on data that's already shaped for
 the kernel.
 
