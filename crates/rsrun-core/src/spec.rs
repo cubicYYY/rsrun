@@ -45,6 +45,10 @@ pub struct Spec {
     /// process.oomScoreAdj: -1000..=1000. Written to
     /// /proc/<init>/oom_score_adj from the parent after clone3.
     pub oom_score_adj: Option<i32>,
+    /// process.scheduler: per-init-task SCHED_* policy + parameters.
+    /// Applied via sched_setattr(2) from the parent after clone3.
+    /// None = leave the kernel default (SCHED_OTHER, nice 0).
+    pub scheduler: Option<SchedulerSpec>,
     /// linux.maskedPaths: bind-mount /dev/null over each (file) or
     /// remount tmpfs RDONLY over each (dir).
     pub masked_paths: Vec<String>,
@@ -68,6 +72,24 @@ pub struct RLimit {
     pub kind: RLimitKind,
     pub soft: u64,
     pub hard: u64,
+}
+
+/// `process.scheduler` payload, normalized for direct `sched_setattr`
+/// use. We don't validate cross-field constraints (e.g. `runtime <=
+/// deadline <= period` for SCHED_DEADLINE) — the kernel does that and
+/// returns EINVAL, which we surface verbatim.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerSpec {
+    /// SCHED_OTHER=0, SCHED_FIFO=1, SCHED_RR=2, SCHED_BATCH=3,
+    /// SCHED_IDLE=5, SCHED_DEADLINE=6. Mapped from the OCI string.
+    pub policy: u32,
+    pub nice: i32,
+    pub priority: u32,
+    /// Bitmask of SCHED_FLAG_* values (e.g. RESET_ON_FORK = 0x1).
+    pub flags: u64,
+    pub runtime: u64,
+    pub deadline: u64,
+    pub period: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +197,7 @@ impl Spec {
             .get("oomScoreAdj")
             .and_then(Value::as_i64)
             .map(|n| n as i32);
+        let scheduler = process.get("scheduler").map(parse_scheduler).transpose()?;
         let apparmor_profile = process
             .get("apparmorProfile")
             .and_then(Value::as_str)
@@ -362,10 +385,62 @@ impl Spec {
             sysctls,
             rootfs_propagation,
             oom_score_adj,
+            scheduler,
             raw: v,
             bundle: bundle.to_path_buf(),
         })
     }
+}
+
+fn parse_scheduler(v: &Value) -> std::io::Result<SchedulerSpec> {
+    let policy = match v.get("policy").and_then(Value::as_str).unwrap_or("") {
+        "SCHED_OTHER" | "" => 0,
+        "SCHED_FIFO" => 1,
+        "SCHED_RR" => 2,
+        "SCHED_BATCH" => 3,
+        "SCHED_IDLE" => 5,
+        "SCHED_DEADLINE" => 6,
+        other => {
+            return Err(std::io::Error::other(format!(
+                "process.scheduler: unknown policy {other}"
+            )));
+        }
+    };
+    let nice = v.get("nice").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let priority = v.get("priority").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let runtime = v.get("runtime").and_then(Value::as_u64).unwrap_or(0);
+    let deadline = v.get("deadline").and_then(Value::as_u64).unwrap_or(0);
+    let period = v.get("period").and_then(Value::as_u64).unwrap_or(0);
+    let mut flags: u64 = 0;
+    if let Some(arr) = v.get("flags").and_then(Value::as_array) {
+        for f in arr {
+            let Some(name) = f.as_str() else { continue };
+            // Kernel sched_attr flag bits (linux/sched/types.h).
+            flags |= match name {
+                "SCHED_FLAG_RESET_ON_FORK" => 0x01,
+                "SCHED_FLAG_RECLAIM" => 0x02,
+                "SCHED_FLAG_DL_OVERRUN" => 0x04,
+                "SCHED_FLAG_KEEP_POLICY" => 0x08,
+                "SCHED_FLAG_KEEP_PARAMS" => 0x10,
+                "SCHED_FLAG_UTIL_CLAMP_MIN" => 0x20,
+                "SCHED_FLAG_UTIL_CLAMP_MAX" => 0x40,
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "process.scheduler: unknown flag {other}"
+                    )));
+                }
+            };
+        }
+    }
+    Ok(SchedulerSpec {
+        policy,
+        nice,
+        priority,
+        flags,
+        runtime,
+        deadline,
+        period,
+    })
 }
 
 fn parse_rlimit(v: &Value) -> Option<RLimit> {
@@ -495,6 +570,39 @@ mod tests {
 
         let no_args = json!({"process": {}, "root": {"path": "rootfs"}});
         assert!(Spec::from_value(no_args, Path::new("/bundle")).is_err());
+    }
+
+    #[test]
+    fn scheduler_parses_policy_and_fields() {
+        let v = json!({
+            "process": {
+                "args": ["/bin/true"],
+                "scheduler": {
+                    "policy": "SCHED_FIFO",
+                    "priority": 50,
+                    "flags": ["SCHED_FLAG_RESET_ON_FORK"]
+                }
+            },
+            "root": {"path": "rootfs"}
+        });
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        let s = spec.scheduler.unwrap();
+        assert_eq!(s.policy, 1); // SCHED_FIFO
+        assert_eq!(s.priority, 50);
+        assert_eq!(s.flags, 0x01); // RESET_ON_FORK
+        assert_eq!(s.nice, 0);
+    }
+
+    #[test]
+    fn scheduler_unknown_policy_rejected() {
+        let v = json!({
+            "process": {
+                "args": ["/bin/true"],
+                "scheduler": {"policy": "SCHED_NOT_REAL"}
+            },
+            "root": {"path": "rootfs"}
+        });
+        assert!(Spec::from_value(v, Path::new("/bundle")).is_err());
     }
 
     #[test]

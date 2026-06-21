@@ -56,7 +56,7 @@ use crate::state::{read_pid, write_state, ContainerPaths};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execve, execvpe, mkfifo, pivot_root, sethostname, Pid};
 use std::ffi::CString;
 use std::io::Write;
@@ -266,10 +266,10 @@ pub fn cmd_create_full(
         .iter()
         .any(|(k, _)| matches!(k, crate::spec::NamespaceKind::Pid));
     let mut pid_relay_pipe: [i32; 2] = [-1, -1];
-    if needs_pid_join_fork {
-        if unsafe { libc::pipe2(pid_relay_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+    if needs_pid_join_fork
+        && unsafe { libc::pipe2(pid_relay_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
     let pid_relay_read = pid_relay_pipe[0];
     let pid_relay_write = pid_relay_pipe[1];
@@ -447,27 +447,54 @@ pub fn cmd_create_full(
         let _ = std::fs::write(&path, adj.to_string());
     }
 
-    std::fs::write(paths.pid_file(), init_pid.to_string())?;
-    if let Some(pf) = pid_file {
-        std::fs::write(pf, init_pid.to_string())?;
-    }
-    let pid = init_pid;
-    // commHint is the basename of argv[0] truncated to 15 chars (kernel comm
-    // limit). Used by `state` to detect pid reuse.
+    // Write init.pid + state.json("creating") *before* any post-clone3
+    // step that can fail. If we crash between here and the final
+    // state.json("created") below, `delete` can still find the orphan
+    // init via init.pid and SIGKILL it; without this, a kill-mid-create
+    // leaks the init forever.
     let comm_hint = spec
         .args
         .first()
         .and_then(|s| std::path::Path::new(s).file_name().and_then(|n| n.to_str()));
-    write_state(&paths, id, pid, &bundle, "created", comm_hint)?;
+    std::fs::write(paths.pid_file(), init_pid.to_string())?;
+    if let Some(pf) = pid_file {
+        std::fs::write(pf, init_pid.to_string())?;
+    }
+    write_state(&paths, id, init_pid, &bundle, "creating", comm_hint)?;
 
-    // Persist hooks for `start` / `delete` to fire later. Skip writing
-    // the file entirely when there are none — keeps the no-hooks path
-    // free of an extra fs write.
-    if !plan.ext.hooks.is_empty() {
-        std::fs::write(
-            paths.root.join("hooks.json"),
-            serde_json::to_vec(&plan.ext.hooks.to_json())?,
-        )?;
+    // Anything below here that errors must not leak the init. The
+    // `?`-using sites (apply_scheduler, hooks persist) call into
+    // `kill_init_on_err` if they fail.
+    let result: std::io::Result<()> = (|| {
+        if let Some(s) = plan.scheduler {
+            apply_scheduler(init_pid, &s)?;
+        }
+        // Persist hooks for `start` / `delete` to fire later. Skip
+        // writing entirely when there are none — keeps the no-hooks
+        // path free of an extra fs write.
+        if !plan.ext.hooks.is_empty() {
+            std::fs::write(
+                paths.root.join("hooks.json"),
+                serde_json::to_vec(&plan.ext.hooks.to_json())?,
+            )?;
+        }
+        // Final transition: "creating" → "created". `start` will move
+        // it on to "running".
+        write_state(&paths, id, init_pid, &bundle, "created", comm_hint)?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        // SIGKILL the orphan init and tear down state. The init is
+        // still blocked on opening the FIFO read-side, so it hasn't
+        // execve'd yet — a SIGKILL is clean.
+        unsafe { libc::kill(init_pid, libc::SIGKILL) };
+        // Best-effort reap; the parent is the init's parent so the
+        // kernel will deliver the exit status here.
+        let mut status = 0i32;
+        unsafe { libc::waitpid(init_pid, &mut status, 0) };
+        let _ = paths.destroy();
+        return Err(e);
     }
     Ok(())
 }
@@ -569,6 +596,41 @@ fn run_hooks(hooks: &[crate::plan::HookCmd], id: &str) -> std::io::Result<()> {
         }
         // Parent: wait, killing the hook if it exceeds its timeout.
         wait_hook_with_timeout(pid, h.timeout_ms)?;
+    }
+    Ok(())
+}
+
+/// Apply a `process.scheduler` spec to `pid` via `sched_setattr(2)`.
+/// Layout matches `struct sched_attr` in <linux/sched/types.h>; size is
+/// passed so the kernel can ignore newer fields on older kernels.
+fn apply_scheduler(pid: libc::pid_t, s: &crate::spec::SchedulerSpec) -> std::io::Result<()> {
+    // libc::SYS_sched_setattr is arch-correct (314 on x86_64, 274 on
+    // aarch64). The struct layout below is the same on both.
+    #[repr(C)]
+    #[derive(Default)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+    }
+    let attr = SchedAttr {
+        size: std::mem::size_of::<SchedAttr>() as u32,
+        sched_policy: s.policy,
+        sched_flags: s.flags,
+        sched_nice: s.nice,
+        sched_priority: s.priority,
+        sched_runtime: s.runtime,
+        sched_deadline: s.deadline,
+        sched_period: s.period,
+    };
+    let rc = unsafe { libc::syscall(libc::SYS_sched_setattr, pid, &attr as *const _, 0u32) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -1117,10 +1179,8 @@ unsafe fn child_run(
 
     // 8c. Now transition to non-root user. PR_SET_KEEPCAPS preserves
     // permitted across setresuid; we set it right before setresuid.
-    if plan.user_gid != 0 {
-        if libc::setresgid(plan.user_gid, plan.user_gid, plan.user_gid) < 0 {
-            child_die(err_fd, 109, b"setresgid failed");
-        }
+    if plan.user_gid != 0 && libc::setresgid(plan.user_gid, plan.user_gid, plan.user_gid) < 0 {
+        child_die(err_fd, 109, b"setresgid failed");
     }
     if plan.user_uid != 0 {
         if libc::prctl(libc::PR_SET_KEEPCAPS, 1u64, 0u64, 0u64, 0u64) < 0 {
@@ -1572,15 +1632,15 @@ fn spawn_idmap_helpers(mounts: &[crate::plan::MountOp]) -> std::io::Result<Vec<i
                 // single-line gid_map without being root in the parent
                 // userns.
                 let _ = std::fs::write("/proc/self/setgroups", b"deny");
-                if !m.idmap_uid.is_empty() {
-                    if std::fs::write("/proc/self/uid_map", &m.idmap_uid).is_err() {
-                        libc::_exit(2);
-                    }
+                if !m.idmap_uid.is_empty()
+                    && std::fs::write("/proc/self/uid_map", &m.idmap_uid).is_err()
+                {
+                    libc::_exit(2);
                 }
-                if !m.idmap_gid.is_empty() {
-                    if std::fs::write("/proc/self/gid_map", &m.idmap_gid).is_err() {
-                        libc::_exit(3);
-                    }
+                if !m.idmap_gid.is_empty()
+                    && std::fs::write("/proc/self/gid_map", &m.idmap_gid).is_err()
+                {
+                    libc::_exit(3);
                 }
                 let one = b'1';
                 let _ = libc::write(sync_pipe[1], &one as *const u8 as *const _, 1);
@@ -2183,37 +2243,32 @@ pub fn cmd_delete(id: &str, force: bool) -> std::io::Result<()> {
     }
 
     // OCI: `delete` without -f MUST fail if container is not stopped.
+    // Crash-recovery path (state.json missing but init.pid present):
+    // treat a live orphan init as not-stopped for this check.
     if !force {
-        if let Ok(bytes) = std::fs::read(paths.state_file()) {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                let status = v
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("created");
-                let pid = v.get("pid").and_then(|p| p.as_i64()).unwrap_or(0) as i32;
-                let comm = v.get("commHint").and_then(|s| s.as_str());
-                if status != "stopped" && pid > 0 && is_init_alive(pid, comm) {
-                    return Err(std::io::Error::other(format!(
-                        "cannot delete container {id} in state {status}; use --force"
-                    )));
-                }
-            }
+        let (status, pid, comm) = read_status_pid_comm(&paths);
+        if status.as_deref() != Some("stopped") && pid > 0 && is_init_alive(pid, comm.as_deref()) {
+            let st = status.as_deref().unwrap_or("creating");
+            return Err(std::io::Error::other(format!(
+                "cannot delete container {id} in state {st}; use --force"
+            )));
         }
     }
 
     if let Ok(pid) = read_pid(&paths) {
+        let pid_raw = pid;
         let pid = Pid::from_raw(pid);
         if force {
             let _ = kill(pid, Signal::SIGKILL);
         }
-        // Reap. If the workload already exited, this returns ECHILD which
-        // is fine (the previous owner of the pid waited or the kernel
-        // auto-reaped because we lost track after parent exit).
+        // Bound the wait: if the init isn't our child (lost across a
+        // parent exit) waitpid returns ECHILD immediately. If it *is*
+        // our child but we didn't kill (force=false on a stopped
+        // container), waitpid is fine. The only hang risk is a live
+        // unkilled orphan, but the !force branch above rejected that.
         let _ = waitpid(pid, None);
-        // If we couldn't wait (e.g. not our child after parent exited),
-        // poll /proc/<pid> until it disappears. Bounded to ~1s.
         for _ in 0..200 {
-            if !std::path::Path::new(&format!("/proc/{}", pid.as_raw())).exists() {
+            if !std::path::Path::new(&format!("/proc/{}", pid_raw)).exists() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2238,7 +2293,34 @@ pub fn cmd_state(id: &str) -> std::io::Result<()> {
             "container {id} does not exist"
         )));
     }
-    let bytes = std::fs::read(paths.state_file())?;
+    // Crash-recovery path: state.json is missing but init.pid was
+    // written. We treat this as "creating" if the init is alive,
+    // "stopped" otherwise — same as crun's recovery from
+    // killed-mid-create. The caller can then `delete -f` to clean up.
+    let bytes = match std::fs::read(paths.state_file()) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let pid = read_pid(&paths).unwrap_or(0);
+            let status = if pid > 0 && is_init_alive(pid, None) {
+                "creating"
+            } else {
+                "stopped"
+            };
+            let synthesized = serde_json::json!({
+                "ociVersion": "1.0.2",
+                "id": id,
+                "status": status,
+                "pid": pid,
+                "bundle": "",
+                "annotations": {},
+            });
+            let out = serde_json::to_vec(&synthesized)?;
+            std::io::stdout().write_all(&out)?;
+            std::io::stdout().write_all(b"\n")?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
     let status = value
         .get("status")
@@ -2280,6 +2362,29 @@ fn read_comm_hint(paths: &ContainerPaths) -> Option<String> {
     let bytes = std::fs::read(paths.state_file()).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     v.get("commHint").and_then(|s| s.as_str()).map(String::from)
+}
+
+/// Read `(status, pid, commHint)` from state.json with a fallback to
+/// init.pid for the crash-recovery case where state.json is missing
+/// but the init was already started. Status is `Some("creating")` in
+/// that case so callers can distinguish a torn-down container from a
+/// half-created one.
+fn read_status_pid_comm(paths: &ContainerPaths) -> (Option<String>, i32, Option<String>) {
+    if let Ok(bytes) = std::fs::read(paths.state_file()) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let status = v.get("status").and_then(|s| s.as_str()).map(String::from);
+            let pid = v.get("pid").and_then(|p| p.as_i64()).unwrap_or(0) as i32;
+            let comm = v.get("commHint").and_then(|s| s.as_str()).map(String::from);
+            return (status, pid, comm);
+        }
+    }
+    let pid = read_pid(paths).unwrap_or(0);
+    let status = if pid > 0 {
+        Some(String::from("creating"))
+    } else {
+        None
+    };
+    (status, pid, None)
 }
 
 fn read_bundle(paths: &ContainerPaths) -> std::io::Result<PathBuf> {

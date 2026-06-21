@@ -8,6 +8,12 @@
 //! AppArmor / SELinux. Those live in `rsrun-ext` and are linked only
 //! into the standalone `rsrun` binary.
 
+// `child_run` runs in a post-clone3 child where keeping every fd /
+// param explicit is clearer than packing them into a struct, and the
+// trailing `_exit(127)` after `child_run(...) -> !` is a paranoia guard
+// the optimizer prunes anyway. Both fire only on this one function.
+#![allow(clippy::too_many_arguments, unreachable_code)]
+
 pub mod clone3;
 pub mod plan;
 pub mod spec;

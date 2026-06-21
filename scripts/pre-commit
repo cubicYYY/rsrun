@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce `cargo fmt` on staged Rust files.
+#
+# Install once with:
+#   bash scripts/install-hooks.sh
+#
+# Runs in seconds because we only invoke `cargo fmt` on the files git
+# already staged. If anything would be reformatted, the commit is
+# refused and the user is told the exact command to run.
+set -euo pipefail
+
+# Collect staged .rs files. Empty diff → nothing to do.
+mapfile -t files < <(git diff --name-only --cached --diff-filter=ACMR | grep -E '\.rs$' || true)
+[[ ${#files[@]} -eq 0 ]] && exit 0
+
+# `--check` is silent on success and prints a diff on failure.
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+  echo "✗ rustfmt: staged changes are not formatted." >&2
+  echo "  Fix:  cargo fmt --all" >&2
+  echo "  Then: git add -u && git commit" >&2
+  exit 1
+fi

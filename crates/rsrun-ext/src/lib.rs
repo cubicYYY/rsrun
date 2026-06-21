@@ -8,6 +8,10 @@
 //! who want a minimal binary can build with `--no-default-features`
 //! and pick only what they need.
 
+// One return shape in cgroup.rs that clippy thinks should be a type
+// alias — keeping it inline because it's only used at one call site.
+#![allow(clippy::type_complexity)]
+
 #[cfg(feature = "cgroup-limits")]
 pub mod cgroup;
 #[cfg(feature = "device-cgroup-bpf")]
@@ -21,14 +25,16 @@ pub fn compile(
     spec: &rsrun_core::spec::Spec,
     container_id: &str,
 ) -> std::io::Result<rsrun_core::plan::ExtPlan> {
-    let linux = spec.raw.get("linux");
+    let _linux = spec.raw.get("linux");
+    // Re-bind only when at least one consumer is compiled in — keeps
+    // the no-default-features build silent on `unused_variables`.
     #[cfg(any(
         feature = "seccomp",
         feature = "cgroup-limits",
         feature = "device-cgroup-bpf",
         feature = "hooks",
     ))]
-    let _ = linux;
+    let linux = _linux;
 
     #[cfg(feature = "seccomp")]
     let seccomp_bpf = seccomp::compile(linux.and_then(|l| l.get("seccomp")))?;

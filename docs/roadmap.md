@@ -27,21 +27,24 @@ behavior with no diagnostic.
   paths. Verified end-to-end: a `poststop` hook of `sleep 30` with
   `timeout: 1` exits the runtime in ~1s instead of hanging for 30s.
   Tier 2 #6.
-- **`process.scheduler`**. K8s QoS classes (Guaranteed pods) rely on
-  `SCHED_RR` / `SCHED_DEADLINE` being honored. Without it the
-  scheduler thinks the pod has guarantees that aren't actually
-  applied. Tier 2 #9.
-- **Crash recovery between `create` and `start`**. If `rsrun create`
-  is killed between `clone3` and writing `state.json`, the orphan
-  init keeps running and `delete` can't clean it up. crun has
-  recovery logic; rsrun doesn't. ~80 LOC + a test plan. New.
-- **Multi-arch verification on x86_64**. ✅ Seccomp x86_64 syscall
+- ✅ **`process.scheduler`**. `sched_setattr(2)` from the parent on
+  the init pid, after clone3. All six policies + 7 flag bits + nice +
+  priority + DEADLINE runtime/deadline/period. Verified end-to-end:
+  `chrt -p` reports the requested policy; `/proc/<pid>/stat` confirms
+  the kernel applied it. Tier 2 #9.
+- ✅ **Crash recovery between `create` and `start`**. `init.pid` and
+  a `"creating"`-status `state.json` are now written before any
+  post-clone3 step that can fail. Failures after clone3 SIGKILL the
+  init and tear down the state dir; survival of a parent kill leaves
+  a recoverable orphan that `state` reports as `"creating"` and that
+  `delete -f` cleans up. Verified end-to-end. Tier 2 #14.
+- ✅ **Multi-arch verification on x86_64**. Seccomp x86_64 syscall
   table populated from kernel `syscall_64.tbl` v6.6 (365 names). All
   other direct-syscall sites use `libc::SYS_*` (arch-correct) or
   generic-table numbers shared between aarch64 and x86_64 (`clone3`,
-  `open_tree`, `move_mount`, `mount_setattr`). Remaining: end-to-end
-  test on an actual x86_64 host (CI matrix). Tracked under
-  Build/packaging.
+  `open_tree`, `move_mount`, `mount_setattr`). `.github/workflows/ci.yml`
+  runs unit tests + lifecycle smoke + runtime-tools validation on both
+  `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64) on every PR.
 
 ### M2 — works on the fleet (~6-8 weeks)
 
@@ -77,8 +80,9 @@ which includes niche features that rarely matter in production
 - `tmpcopyup` mount option (some K8s ConfigMap patterns).
 - Recursive mount propagation flags (`rro`, `rrw`, …).
 - Distro packaging, signed releases, supply-chain attestation.
-- CI pipeline running runtime-tools + youki contest harness on every
-  PR.
+- youki `contest` harness alongside runtime-tools in CI (currently
+  only the runtime-tools subset under `scripts/oci_validation.sh`
+  runs).
 
 ### Status disclaimer for the README
 
@@ -87,10 +91,10 @@ some features are not yet thoroughly tested." Once the M1 list is
 clear, we can replace it with something specific:
 
 > rsrun runs the OCI lifecycle correctly on a single cgroup-v2 host
-> with Docker. It does not yet handle: cgroup-v1 hosts (RHEL 8, AL2),
-> K8s QoS scheduler classes, crash recovery between `create` and
-> `start`, or SELinux mount labels. Don't run it under containerd in
-> production until M1 lands.
+> with Docker. M1 is complete on aarch64; outstanding before
+> production-on-containerd: cgroup-v1 hosts (RHEL 8, AL2) and SELinux
+> mount labels (both M2). x86_64 source builds clean; CI matrix run
+> still pending.
 
 ## Now in tree
 
@@ -188,9 +192,10 @@ Items affect real workloads but only under specific configurations.
 8. **`process.consoleSize`** — `TIOCSWINSZ` after PTY allocation. PTY
    currently inherits the kernel default rows × cols. ~10 LOC.
 
-9. **`process.scheduler`** — `SCHED_FIFO` / `SCHED_RR` /
-   `SCHED_DEADLINE` via `sched_setattr(2)`. Realtime workloads,
-   K8s latency-sensitive pods. ~50 LOC.
+9. ✅ **`process.scheduler`** — `sched_setattr(2)` on the init pid
+   from the parent after clone3. All six policies, 7 flag bits, plus
+   nice / priority / DEADLINE timing fields. Spec rejects unknown
+   policies and flags at parse time.
 
 10. **`linux.mountLabel`** propagation — choose `context=` mount
     option vs `setxattr(security.selinux)` per fstype. SELinux hosts
@@ -206,12 +211,12 @@ Items affect real workloads but only under specific configurations.
     `rsuid` …) via `mount_setattr(MOUNT_ATTR_*, AT_RECURSIVE)`.
     Linux 5.12+. ~30 LOC.
 
-14. **Crash recovery between `create` and `start`**. If rsrun is
-    killed after `clone3` but before `state.json` is written, the
-    orphan init keeps running and there's no pid record for `delete`
-    to act on. crun's recovery path: scan `/run/rsrun/<id>/init.pid`
-    on `state` and infer "stopped" / "creating-orphaned". ~80 LOC plus
-    a kill-mid-create test. M1 blocker.
+14. ✅ **Crash recovery between `create` and `start`**. `init.pid` +
+    `state.json("creating")` written immediately after the host pid is
+    known, before any fallible post-clone3 step. Failures after that
+    point SIGKILL+reap the init and remove the state dir. `cmd_state`
+    on a state-less container synthesizes a `"creating"`-or-`"stopped"`
+    response from init.pid; `delete -f` cleans up either way.
 
 15. **Stats accuracy**. `cmd_stats` reads `cpu.stat` but parses only
     `usage_usec`; `system_usec` and `user_usec` are dropped, so
@@ -254,10 +259,10 @@ Items affect real workloads but only under specific configurations.
 
 ## Build / packaging
 
-- **Multi-arch CI**: source-level x86_64 + aarch64 are both wired
-  (seccomp tables populated for both, all other direct syscalls use
-  `libc::SYS_*` or generic-table numbers). Still missing: a CI job
-  that actually builds + runs the lifecycle on x86_64.
+- ✅ **Multi-arch CI**: `.github/workflows/ci.yml` exercises both
+  `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64) for unit
+  tests, the M1 lifecycle smoke (`scripts/smoke.sh`), and OCI
+  runtime-tools validation.
 - **Static musl build**: release binary links dynamically against
   glibc.
 - **Distro packaging**: Debian/Ubuntu .deb, Fedora/RHEL .rpm, AUR.

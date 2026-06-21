@@ -1,0 +1,121 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+  unit:
+    name: unit tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04        # x86_64
+            arch: x86_64
+          - runner: ubuntu-24.04-arm    # aarch64
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-${{ matrix.arch }}
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace --no-default-features --locked
+
+  lifecycle-smoke:
+    name: lifecycle smoke (${{ matrix.runner }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-${{ matrix.arch }}
+      - name: Confirm host is cgroup-v2
+        run: |
+          set -e
+          if ! mountpoint -q /sys/fs/cgroup || \
+             [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "::error::host is not cgroup-v2 unified hierarchy" >&2
+            mount | grep cgroup
+            exit 1
+          fi
+      - name: Install busybox
+        run: sudo apt-get update -qq && sudo apt-get install -y busybox
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Show binary metadata
+        run: |
+          file target/release/rsrun
+          ls -la target/release/rsrun
+      - name: Run lifecycle smoke (M1 surface)
+        run: bash scripts/smoke.sh target/release/rsrun
+
+  oci-validation:
+    name: OCI runtime-tools (${{ matrix.runner }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: oci-${{ matrix.arch }}
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run runtime-tools validation
+        run: bash scripts/oci_validation.sh target/release/rsrun
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-logs-${{ matrix.arch }}
+          path: tests/log/
+          retention-days: 7

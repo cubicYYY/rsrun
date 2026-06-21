@@ -85,6 +85,11 @@ pub struct CompiledPlan {
     /// Written from the parent to /proc/<pid>/oom_score_adj after
     /// clone3 returns, before `start` would unblock the FIFO.
     pub oom_score_adj: Option<i32>,
+    /// `process.scheduler` from the spec. None = leave kernel default.
+    /// Applied from the parent via sched_setattr(2) right after clone3
+    /// — same window as oom_score_adj. Realtime classes (SCHED_FIFO,
+    /// SCHED_RR, SCHED_DEADLINE) require CAP_SYS_NICE.
+    pub scheduler: Option<crate::spec::SchedulerSpec>,
     /// Hostname to set inside the UTS namespace.
     pub hostname: CString,
     /// Resolved absolute path to rootfs.
@@ -481,6 +486,7 @@ impl CompiledPlan {
             rootfs_propagation: parse_propagation(spec.rootfs_propagation.as_deref()),
             no_pivot: false,
             oom_score_adj: spec.oom_score_adj,
+            scheduler: spec.scheduler,
         })
     }
 }

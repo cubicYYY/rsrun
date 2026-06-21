@@ -21,10 +21,15 @@ cargo build              # debug
 cargo build --release    # release (use this for benches)
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test               # 46 unit tests in <1s
+cargo test               # 48 unit tests in <1s
+scripts/smoke.sh                    # M1 lifecycle smoke (10 checks)
 scripts/oci_validation.sh           # OCI runtime-tools (16/16)
 scripts/bench.sh crun youki runc    # hyperfine comparison
 ```
+
+`bash scripts/install-hooks.sh` installs a pre-commit hook that runs
+`cargo fmt --all -- --check` on staged Rust files. CI rejects unformatted
+PRs, so installing the hook avoids round-trips.
 
 For IDE support on macOS, point rust-analyzer at the Linux target by
 adding to `.vscode/settings.json` or your editor's rust-analyzer config:
