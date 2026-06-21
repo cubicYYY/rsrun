@@ -1209,12 +1209,12 @@ unsafe fn child_run(
         }
     }
 
-    // 8c. no_new_privs (PR_SET_NO_NEW_PRIVS) — required for exec to honor
-    // capability/seccomp restrictions across boundary. Always set when a
-    // seccomp filter is present, since `prctl(PR_SET_SECCOMP)` itself
-    // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS=1.
-    let need_no_new_privs = plan.no_new_privileges || !plan.ext.seccomp_bpf.is_empty();
-    if need_no_new_privs {
+    // 8c. no_new_privs (PR_SET_NO_NEW_PRIVS). Strictly honor the spec:
+    // set if-and-only-if `process.noNewPrivileges` is true. Forcing it
+    // for seccomp would violate the "default" spec (NNP=false) which
+    // ships a no-op SCMP_ACT_ALLOW profile. PR_SET_SECCOMP itself
+    // works without NNP when the caller has CAP_SYS_ADMIN.
+    if plan.no_new_privileges {
         let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64);
     }
 

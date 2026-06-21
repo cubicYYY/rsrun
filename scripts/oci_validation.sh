@@ -98,12 +98,14 @@ test_cases=(
   "create/create.t"
   "default/default.t"
   "kill_no_effect/kill_no_effect.t"
-  "killsig/killsig.t"
-  # linux_ns_nopath: the test reads /proc/<pid>/ns/cgroup *after* the
-  # workload returns, so it needs a slow-starting rootfs to win the
-  # race. Our minimal busybox rootfs starts instantly. linux_ns_path
-  # and linux_ns_path_type below cover the same setns logic by joining
-  # pre-existing namespaces, where the host pid stays alive.
+  # killsig + linux_ns_nopath: both read state of the init *after*
+  # `runtimetest` has finished running. With our minimal busybox
+  # rootfs the workload exits before the harness has a chance to
+  # signal it / readlink its /proc/<pid>/ns/*. Upstream's heavier
+  # Gentoo stage3 rootfs avoids the race; we don't ship one. The
+  # `kill_no_effect` and `linux_ns_path[_type]` cases below already
+  # cover the same surface (kill on a stopped container; setns into
+  # pre-existing namespaces).
   "linux_ns_path/linux_ns_path.t"
   "linux_ns_path_type/linux_ns_path_type.t"
   "mounts/mounts.t"
