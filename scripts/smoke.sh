@@ -29,12 +29,23 @@ fi
 $SUDO rm -rf "$WORK"
 mkdir -p "$WORK"
 
-# Build a busybox-based rootfs once, reuse for every subtest.
+# Build a busybox-based rootfs once, reuse for every subtest. We need
+# a *statically linked* busybox: the rootfs has no glibc, so a dynamic
+# binary would die on execve with ENOENT-on-the-loader. Ubuntu's
+# `busybox` package is dynamic; `busybox-static` is what we want, and
+# it lives at /bin/busybox.
 BUNDLE=$WORK/bundle
 mkdir -p "$BUNDLE/rootfs/bin"
-BB=$(command -v busybox || true)
+BB=""
+for c in /bin/busybox /usr/bin/busybox $(command -v busybox 2>/dev/null || true); do
+  [[ -x $c ]] || continue
+  if file -L "$c" | grep -q "statically linked"; then
+    BB=$c
+    break
+  fi
+done
 if [[ -z $BB ]]; then
-  echo "install busybox first" >&2
+  echo "no statically-linked busybox found; install busybox-static" >&2
   exit 1
 fi
 cp -L "$BB" "$BUNDLE/rootfs/bin/busybox"
@@ -138,11 +149,18 @@ write_config sched ',
   ' '"/bin/sleep", "30"'
 $SUDO $RUNTIME --root $WORK/state.sched create -b "$BUNDLE" c3
 $SUDO $RUNTIME --root $WORK/state.sched start c3
+sleep 0.2
 PID=$($SUDO cat $WORK/state.sched/c3/init.pid)
-policy=$(awk '{print $41}' /proc/$PID/stat)
-nice=$(awk '{print $19}' /proc/$PID/stat)
-check "policy is SCHED_BATCH (3)"  "[[ $policy == 3 ]]"
-check "nice is 7"                  "[[ $nice == 7 ]]"
+if [[ ! -e /proc/$PID/stat ]]; then
+  echo "  workload init pid $PID is gone — child.err follows:" >&2
+  $SUDO cat "$WORK/state.sched/c3/child.err" 2>&1 || true
+  fail=$((fail + 2))
+else
+  policy=$($SUDO awk '{print $41}' /proc/$PID/stat)
+  nice=$($SUDO awk '{print $19}' /proc/$PID/stat)
+  check "policy is SCHED_BATCH (3)" "[[ $policy == 3 ]]"
+  check "nice is 7"                 "[[ $nice == 7 ]]"
+fi
 $SUDO $RUNTIME --root $WORK/state.sched delete -f c3
 
 # ── 4. crash recovery ──────────────────────────────────────────────────

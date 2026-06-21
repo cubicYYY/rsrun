@@ -87,5 +87,15 @@ echo
 echo "OCI validation: $pass passed, $fail failed"
 if (( fail > 0 )); then
   printf '  %s\n' "${failed_cases[@]}"
+  echo
+  echo "── failed-case logs ──────────────────────────────────────────"
+  for case in "${failed_cases[@]}"; do
+    log=$ROOT/tests/log/${case//\//_}.log
+    echo
+    echo "▼ $case"
+    # Print the last ~40 lines of each failed log inline. Full logs
+    # are still uploaded as a workflow artifact.
+    tail -n 40 "$log" 2>&1 | sed 's/^/    /'
+  done
   exit 1
 fi

@@ -76,8 +76,11 @@ jobs:
             mount | grep cgroup
             exit 1
           fi
-      - name: Install busybox
-        run: sudo apt-get update -qq && sudo apt-get install -y busybox
+      - name: Install busybox-static
+        # The rootfs has no glibc, so the smoke needs a *statically*
+        # linked busybox. Ubuntu's `busybox` package is dynamic;
+        # `busybox-static` ships /bin/busybox.
+        run: sudo apt-get update -qq && sudo apt-get install -y busybox-static
       - name: Build release binary
         run: cargo build --release --locked
       - name: Show binary metadata
