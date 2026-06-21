@@ -59,7 +59,11 @@ pub(crate) fn compile_writes(resources: &Value) -> Vec<(String, Vec<u8>)> {
             // OCI's `swap` is total memory+swap; cgroup-v2 wants swap-only.
             // If memory.limit is also set, subtract.
             let mem = memory.get("limit").and_then(Value::as_i64).unwrap_or(0);
-            let swap_only = if mem > 0 && swap >= mem { swap - mem } else { swap };
+            let swap_only = if mem > 0 && swap >= mem {
+                swap - mem
+            } else {
+                swap
+            };
             writes.push(("memory.swap.max".to_string(), encode_bytes(swap_only)));
         }
         if let Some(reserve) = memory.get("reservation").and_then(Value::as_i64) {

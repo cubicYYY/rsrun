@@ -397,7 +397,9 @@ mod tests {
     fn empty_rules_produce_empty_program() {
         assert!(compile(None, None).unwrap().is_empty());
         assert!(compile(Some(&json!({})), None).unwrap().is_empty());
-        assert!(compile(Some(&json!({"devices": []})), None).unwrap().is_empty());
+        assert!(compile(Some(&json!({"devices": []})), None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

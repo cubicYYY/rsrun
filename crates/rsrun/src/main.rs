@@ -196,9 +196,20 @@ fn main() -> ExitCode {
         Cmd::Delete { force, id } => runtime::cmd_delete(&id, force),
         Cmd::State { id } => runtime::cmd_state(&id),
         Cmd::Kill { id, signal } => runtime::cmd_kill(&id, &signal),
-        Cmd::Exec { process, pid_file, detach, id, console_socket, .. } => {
-            runtime::cmd_exec_full(&id, &process, pid_file.as_deref(), detach, console_socket.as_deref())
-        }
+        Cmd::Exec {
+            process,
+            pid_file,
+            detach,
+            id,
+            console_socket,
+            ..
+        } => runtime::cmd_exec_full(
+            &id,
+            &process,
+            pid_file.as_deref(),
+            detach,
+            console_socket.as_deref(),
+        ),
         Cmd::Features => sub_features(),
         Cmd::List => runtime::cmd_list(),
         Cmd::Spec => Err(std::io::Error::other("spec subcommand not implemented")),

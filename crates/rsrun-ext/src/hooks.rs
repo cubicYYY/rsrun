@@ -40,8 +40,8 @@ fn parse_phase(arr: Option<&Value>) -> std::io::Result<Vec<HookCmd>> {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| std::io::Error::other("hook entry missing path"))?;
-        let path_c = CString::new(path)
-            .map_err(|_| std::io::Error::other("hook path contains NUL"))?;
+        let path_c =
+            CString::new(path).map_err(|_| std::io::Error::other("hook path contains NUL"))?;
 
         let argv = h
             .get("args")

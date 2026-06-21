@@ -8,9 +8,7 @@
 //! against `libseccomp` and a hand-rolled BPF emitter on the OCI
 //! default profile (462 syscalls); see `docs/benchmarks.md`.
 
-use seccompiler::{
-    BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
-};
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -59,13 +57,7 @@ pub fn compile(seccomp: Option<&Value>) -> std::io::Result<Vec<libc::sock_filter
     // semantics we want: match → action-of-the-entry (we use Allow
     // because rsrun only honors allowlist entries today),
     // mismatch → defaultAction.
-    let filter = SeccompFilter::new(
-        rules,
-        default,
-        SeccompAction::Allow,
-        arch,
-    )
-    .map_err(io_err)?;
+    let filter = SeccompFilter::new(rules, default, SeccompAction::Allow, arch).map_err(io_err)?;
     let prog: BpfProgram = filter.try_into().map_err(io_err)?;
 
     // BpfProgram is Vec<sock_filter> in seccompiler's wire shape; both
@@ -185,7 +177,10 @@ mod tests {
             "SCMP_ACT_LOG",
             "SCMP_ACT_TRAP",
         ] {
-            assert!(parse_action(Some(action)).is_ok(), "action {action} rejected");
+            assert!(
+                parse_action(Some(action)).is_ok(),
+                "action {action} rejected"
+            );
         }
     }
 

@@ -20,9 +20,9 @@ pub use runtime::{
     cmd_kill, cmd_list, cmd_start, cmd_state,
 };
 
-#[cfg(feature = "pause")]
-pub use runtime::{cmd_pause, cmd_resume};
 #[cfg(feature = "update")]
 pub use runtime::cmd_update;
 #[cfg(feature = "stats")]
 pub use runtime::{cmd_events, cmd_stats};
+#[cfg(feature = "pause")]
+pub use runtime::{cmd_pause, cmd_resume};

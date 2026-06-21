@@ -37,9 +37,10 @@ What rsrun **does not** yet defend against:
   whitelisted syscall with arbitrary arguments.
 - AppArmor profile **stacking** (`change_profile` for
   container-in-container). rsrun does `change_onexec` only.
-- Hook **timeouts** are parsed but not enforced — a runaway hook
-  hangs `create`. Do not run untrusted bundles with hooks until this
-  lands.
+- Hook **timeouts** are honored only when `hooks[i].timeout` is set
+  in the spec. A bundle whose hooks omit `timeout` can still hang the
+  runtime; engines that ingest third-party bundles should inject a
+  default before invoking rsrun.
 
 The full feature gap audit is in
 [gaps-vs-crun.md](gaps-vs-crun.md).

@@ -83,6 +83,9 @@ pub fn write_state(
 pub fn read_pid(paths: &ContainerPaths) -> std::io::Result<i32> {
     let s = std::fs::read_to_string(paths.pid_file())?;
     s.trim().parse().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad pid file: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad pid file: {e}"),
+        )
     })
 }

@@ -274,8 +274,8 @@ pub struct CapBitmasks {
 #[derive(Clone)]
 pub struct DefaultDevice {
     pub path: CString,
-    pub mode: u32,    // file mode (e.g. 0o666)
-    pub kind: char,   // 'c' for char device
+    pub mode: u32,  // file mode (e.g. 0o666)
+    pub kind: char, // 'c' for char device
     pub major: u32,
     pub minor: u32,
 }
@@ -378,19 +378,55 @@ impl CompiledPlan {
         });
 
         let default_devices = vec![
-            DefaultDevice { path: cstr("/dev/null")?,    mode: 0o666, kind: 'c', major: 1, minor: 3 },
-            DefaultDevice { path: cstr("/dev/zero")?,    mode: 0o666, kind: 'c', major: 1, minor: 5 },
-            DefaultDevice { path: cstr("/dev/full")?,    mode: 0o666, kind: 'c', major: 1, minor: 7 },
-            DefaultDevice { path: cstr("/dev/random")?,  mode: 0o666, kind: 'c', major: 1, minor: 8 },
-            DefaultDevice { path: cstr("/dev/urandom")?, mode: 0o666, kind: 'c', major: 1, minor: 9 },
-            DefaultDevice { path: cstr("/dev/tty")?,     mode: 0o666, kind: 'c', major: 5, minor: 0 },
+            DefaultDevice {
+                path: cstr("/dev/null")?,
+                mode: 0o666,
+                kind: 'c',
+                major: 1,
+                minor: 3,
+            },
+            DefaultDevice {
+                path: cstr("/dev/zero")?,
+                mode: 0o666,
+                kind: 'c',
+                major: 1,
+                minor: 5,
+            },
+            DefaultDevice {
+                path: cstr("/dev/full")?,
+                mode: 0o666,
+                kind: 'c',
+                major: 1,
+                minor: 7,
+            },
+            DefaultDevice {
+                path: cstr("/dev/random")?,
+                mode: 0o666,
+                kind: 'c',
+                major: 1,
+                minor: 8,
+            },
+            DefaultDevice {
+                path: cstr("/dev/urandom")?,
+                mode: 0o666,
+                kind: 'c',
+                major: 1,
+                minor: 9,
+            },
+            DefaultDevice {
+                path: cstr("/dev/tty")?,
+                mode: 0o666,
+                kind: 'c',
+                major: 5,
+                minor: 0,
+            },
         ];
         let default_symlinks = vec![
-            (cstr("/proc/self/fd")?,  cstr("/dev/fd")?),
+            (cstr("/proc/self/fd")?, cstr("/dev/fd")?),
             (cstr("/proc/self/fd/0")?, cstr("/dev/stdin")?),
             (cstr("/proc/self/fd/1")?, cstr("/dev/stdout")?),
             (cstr("/proc/self/fd/2")?, cstr("/dev/stderr")?),
-            (cstr("pts/ptmx")?,       cstr("/dev/ptmx")?),
+            (cstr("pts/ptmx")?, cstr("/dev/ptmx")?),
         ];
 
         let masked_paths = spec
@@ -432,16 +468,8 @@ impl CompiledPlan {
             user_gid: spec.user_gid,
             user_additional_gids: spec.user_additional_gids.clone(),
             user_umask: spec.user_umask,
-            apparmor_profile: spec
-                .apparmor_profile
-                .as_deref()
-                .map(cstr)
-                .transpose()?,
-            selinux_label: spec
-                .selinux_label
-                .as_deref()
-                .map(cstr)
-                .transpose()?,
+            apparmor_profile: spec.apparmor_profile.as_deref().map(cstr).transpose()?,
+            selinux_label: spec.selinux_label.as_deref().map(cstr).transpose()?,
             sysctls: spec
                 .sysctls
                 .iter()
@@ -639,10 +667,7 @@ mod tests {
 
     #[test]
     fn cap_mask_or_combines_bits() {
-        let mask = cap_mask(&[
-            "CAP_CHOWN".into(),
-            "CAP_NET_BIND_SERVICE".into(),
-        ]);
+        let mask = cap_mask(&["CAP_CHOWN".into(), "CAP_NET_BIND_SERVICE".into()]);
         assert_eq!(mask, (1u64 << 0) | (1u64 << 10));
     }
 
@@ -662,11 +687,20 @@ mod tests {
         let plan = CompiledPlan::from_spec(&parse(v)).unwrap();
         // pid + mount go into clone_flags; network has a path so it's
         // joined later via setns and not in the clone3 flags.
-        assert!(plan.clone_flags.contains(nix::sched::CloneFlags::CLONE_NEWPID));
-        assert!(plan.clone_flags.contains(nix::sched::CloneFlags::CLONE_NEWNS));
-        assert!(!plan.clone_flags.contains(nix::sched::CloneFlags::CLONE_NEWNET));
+        assert!(plan
+            .clone_flags
+            .contains(nix::sched::CloneFlags::CLONE_NEWPID));
+        assert!(plan
+            .clone_flags
+            .contains(nix::sched::CloneFlags::CLONE_NEWNS));
+        assert!(!plan
+            .clone_flags
+            .contains(nix::sched::CloneFlags::CLONE_NEWNET));
         assert_eq!(plan.join_namespaces.len(), 1);
-        assert_eq!(plan.join_namespaces[0].0, crate::spec::NamespaceKind::Network);
+        assert_eq!(
+            plan.join_namespaces[0].0,
+            crate::spec::NamespaceKind::Network
+        );
         assert_eq!(
             plan.join_namespaces[0].1.as_path(),
             Path::new("/var/run/netns/red")
@@ -679,7 +713,9 @@ mod tests {
         v["linux"] = json!({"namespaces": [{"type": "user"}]});
         let plan = CompiledPlan::from_spec(&parse(v)).unwrap();
         assert!(plan.wants_userns);
-        assert!(plan.clone_flags.contains(nix::sched::CloneFlags::CLONE_NEWUSER));
+        assert!(plan
+            .clone_flags
+            .contains(nix::sched::CloneFlags::CLONE_NEWUSER));
     }
 
     #[test]

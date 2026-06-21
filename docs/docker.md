@@ -104,8 +104,10 @@ roadmap, lower priority).
 
 - **`docker checkpoint` / `docker restore`** unsupported (no CRIU
   integration).
-- **Hook timeout enforcement** — a runaway OCI hook will hang
-  `docker run` indefinitely. Don't run untrusted bundles with hooks.
+- **OCI hook timeouts** — honored when `hooks[i].timeout` is set in
+  `config.json`. CDI plugins that don't set a timeout still hang
+  indefinitely; engines should configure a default per their own
+  policy.
 - **OCI hooks from `~/.docker/config.json`** via
   `runtime.<name>.runtimeArgs` are not passed through by Docker.
   Hooks on the bundle's `config.json` (which is what containerd /

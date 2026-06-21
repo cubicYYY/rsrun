@@ -21,9 +21,11 @@ After M1, rsrun is safe to run on a single host where the operator can
 monitor it. Without these, real users will hit hangs or silently-wrong
 behavior with no diagnostic.
 
-- **Hook timeout enforcement**. A misbehaving CDI hook (NVIDIA GPU
-  plugin, etc.) currently hangs `docker run` indefinitely. Should
-  ship before recommending rsrun for any host that uses CDI plugins.
+- ✅ **Hook timeout enforcement**. `pidfd_open` + `poll` waits for the
+  hook subprocess; on deadline it `SIGKILL`s and reaps. Implemented in
+  both parent (`run_hooks`) and in-container (`run_hooks_unsafe`)
+  paths. Verified end-to-end: a `poststop` hook of `sleep 30` with
+  `timeout: 1` exits the runtime in ~1s instead of hanging for 30s.
   Tier 2 #6.
 - **`process.scheduler`**. K8s QoS classes (Guaranteed pods) rely on
   `SCHED_RR` / `SCHED_DEADLINE` being honored. Without it the
@@ -86,9 +88,9 @@ clear, we can replace it with something specific:
 
 > rsrun runs the OCI lifecycle correctly on a single cgroup-v2 host
 > with Docker. It does not yet handle: cgroup-v1 hosts (RHEL 8, AL2),
-> runaway hooks, K8s QoS scheduler classes, crash recovery between
-> `create` and `start`, or SELinux mount labels. Don't run it under
-> containerd in production until M1 lands.
+> K8s QoS scheduler classes, crash recovery between `create` and
+> `start`, or SELinux mount labels. Don't run it under containerd in
+> production until M1 lands.
 
 ## Now in tree
 
@@ -173,9 +175,11 @@ See [gaps-vs-crun.md](gaps-vs-crun.md) for crun source references.
 
 Items affect real workloads but only under specific configurations.
 
-6. **Hook timeout enforcement** — kill hook subprocess after
-   `hooks[i].timeout` seconds. A misbehaving CDI hook currently hangs
-   `create` forever. ~15 LOC.
+6. ✅ **Hook timeout enforcement** — `pidfd_open` + `poll` with the
+   spec-supplied `hooks[i].timeout`; SIGKILL + reap on deadline.
+   Implemented for both parent-side (`run_hooks`) and post-clone3
+   in-container (`run_hooks_unsafe`) phases. Falls back to blocking
+   wait on kernels without `pidfd_open` (< 5.3).
 
 7. **`linux.sysctl` conflict validation** — reject conflicts with the
    `hostname` field, namespace-required sysctls without the matching

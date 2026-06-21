@@ -157,10 +157,7 @@ impl Spec {
     pub fn from_value(v: Value, bundle: &std::path::Path) -> std::io::Result<Self> {
         let process = v.get("process").ok_or_else(missing("process"))?;
         let args = string_array(process.get("args").ok_or_else(missing("process.args"))?);
-        let env = process
-            .get("env")
-            .map(string_array)
-            .unwrap_or_default();
+        let env = process.get("env").map(string_array).unwrap_or_default();
         let cwd = process
             .get("cwd")
             .and_then(Value::as_str)
@@ -265,16 +262,10 @@ impl Spec {
                 .filter(|s| !s.is_empty())
                 .map(String::from);
             if let Some(arr) = linux.get("maskedPaths").and_then(Value::as_array) {
-                masked_paths.extend(
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from)),
-                );
+                masked_paths.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
             }
             if let Some(arr) = linux.get("readonlyPaths").and_then(Value::as_array) {
-                readonly_paths.extend(
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from)),
-                );
+                readonly_paths.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
             }
             if let Some(nsa) = linux.get("namespaces").and_then(Value::as_array) {
                 for ns in nsa {
@@ -327,10 +318,7 @@ impl Spec {
                     .and_then(Value::as_str)
                     .unwrap_or("none")
                     .to_string();
-                let options = m
-                    .get("options")
-                    .map(string_array)
-                    .unwrap_or_default();
+                let options = m.get("options").map(string_array).unwrap_or_default();
                 let parse_maps = |key: &str| -> Vec<IdMapping> {
                     m.get(key)
                         .and_then(Value::as_array)

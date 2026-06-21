@@ -164,12 +164,8 @@ pub fn cmd_create_full(
     // permission to traverse /run/rsrun/<id>/, so opening from the
     // child fails with EACCES. Pre-open dodges that, and saves the
     // child one open(2) on the hot path. Inherited fd is *not* CLOEXEC.
-    let fifo_fd_inherited = unsafe {
-        libc::open(
-            fifo_cstr.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK,
-        )
-    };
+    let fifo_fd_inherited =
+        unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     if fifo_fd_inherited < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -193,12 +189,7 @@ pub fn cmd_create_full(
     // checks it (the wants_userns flag short-circuits the check).
     let mut userns_sync_pipe: [i32; 2] = [-1, -1];
     if plan.wants_userns {
-        let rc = unsafe {
-            libc::pipe2(
-                userns_sync_pipe.as_mut_ptr(),
-                libc::O_CLOEXEC,
-            )
-        };
+        let rc = unsafe { libc::pipe2(userns_sync_pipe.as_mut_ptr(), libc::O_CLOEXEC) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -394,13 +385,11 @@ pub fn cmd_create_full(
         let _ = std::fs::write(&setgroups_path, b"deny");
 
         let uid_map_path = format!("/proc/{}/uid_map", pid);
-        std::fs::write(&uid_map_path, &plan.uid_map_data).map_err(|e| {
-            std::io::Error::other(format!("write uid_map: {e}"))
-        })?;
+        std::fs::write(&uid_map_path, &plan.uid_map_data)
+            .map_err(|e| std::io::Error::other(format!("write uid_map: {e}")))?;
         let gid_map_path = format!("/proc/{}/gid_map", pid);
-        std::fs::write(&gid_map_path, &plan.gid_map_data).map_err(|e| {
-            std::io::Error::other(format!("write gid_map: {e}"))
-        })?;
+        std::fs::write(&gid_map_path, &plan.gid_map_data)
+            .map_err(|e| std::io::Error::other(format!("write gid_map: {e}")))?;
 
         // Tell child it can proceed.
         let one = b'1';
@@ -422,13 +411,8 @@ pub fn cmd_create_full(
         let mut buf = [0u8; 4];
         let mut got = 0usize;
         while got < 4 {
-            let n = unsafe {
-                libc::read(
-                    pid_relay_read,
-                    buf.as_mut_ptr().add(got) as *mut _,
-                    4 - got,
-                )
-            };
+            let n =
+                unsafe { libc::read(pid_relay_read, buf.as_mut_ptr().add(got) as *mut _, 4 - got) };
             if n <= 0 {
                 unsafe { libc::close(pid_relay_read) };
                 return Err(std::io::Error::other(
@@ -470,11 +454,10 @@ pub fn cmd_create_full(
     let pid = init_pid;
     // commHint is the basename of argv[0] truncated to 15 chars (kernel comm
     // limit). Used by `state` to detect pid reuse.
-    let comm_hint = spec.args.first().and_then(|s| {
-        std::path::Path::new(s)
-            .file_name()
-            .and_then(|n| n.to_str())
-    });
+    let comm_hint = spec
+        .args
+        .first()
+        .and_then(|s| std::path::Path::new(s).file_name().and_then(|n| n.to_str()));
     write_state(&paths, id, pid, &bundle, "created", comm_hint)?;
 
     // Persist hooks for `start` / `delete` to fire later. Skip writing
@@ -507,8 +490,8 @@ fn load_hooks(paths: &ContainerPaths) -> crate::plan::Hooks {
 /// Payload is the path "/dev/ptmx" (any short non-empty bytes work;
 /// engines just consume + drop it).
 fn send_pty_master(socket_path: &Path, master_fd: i32) -> std::io::Result<()> {
-    use std::os::unix::net::UnixStream;
     use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
 
     let stream = UnixStream::connect(socket_path)?;
     let sock_fd = stream.as_raw_fd();
@@ -575,20 +558,86 @@ fn run_hooks(hooks: &[crate::plan::HookCmd], id: &str) -> std::io::Result<()> {
                 let _ = libc::write(fds[1], state_json.as_ptr() as _, state_json.len());
                 libc::close(fds[1]);
             }
-            let mut argv: Vec<*const libc::c_char> =
-                h.args.iter().map(|c| c.as_ptr()).collect();
+            let mut argv: Vec<*const libc::c_char> = h.args.iter().map(|c| c.as_ptr()).collect();
             argv.push(std::ptr::null());
-            let mut envp: Vec<*const libc::c_char> =
-                h.env.iter().map(|c| c.as_ptr()).collect();
+            let mut envp: Vec<*const libc::c_char> = h.env.iter().map(|c| c.as_ptr()).collect();
             envp.push(std::ptr::null());
             unsafe {
                 libc::execve(h.path.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 libc::_exit(127);
             }
         }
-        // Parent: wait, honoring optional timeout.
-        let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        // Parent: wait, killing the hook if it exceeds its timeout.
+        wait_hook_with_timeout(pid, h.timeout_ms)?;
+    }
+    Ok(())
+}
+
+/// Wait for `pid` to exit; if `timeout_ms` is set and the deadline
+/// passes, send SIGKILL and reap. Implemented with `pidfd_open` + `poll`
+/// so we don't disturb SIGCHLD or burn CPU. SIGKILL is unconditional —
+/// the OCI spec calls hook timeout "implementation defined" but every
+/// other runtime hard-kills.
+fn wait_hook_with_timeout(pid: libc::pid_t, timeout_ms: Option<u64>) -> std::io::Result<()> {
+    const SYS_PIDFD_OPEN: libc::c_long = 434;
+    let mut status = 0i32;
+    let Some(ms) = timeout_ms else {
+        // No timeout: blocking wait with EINTR retry.
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if r >= 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+    };
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid, 0u32) } as i32;
+    if pidfd < 0 {
+        // Kernel < 5.3 or seccomp denied. Fall back to blocking wait —
+        // honoring the timeout is best-effort on those hosts.
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        return if r < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+    }
+    let timeout = i32::try_from(ms.min(i32::MAX as u64)).unwrap_or(i32::MAX);
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = loop {
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if r >= 0 {
+            break r;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        unsafe { libc::close(pidfd) };
+        return Err(e);
+    };
+    unsafe { libc::close(pidfd) };
+    if rc == 0 {
+        // Timed out. SIGKILL and reap.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+        return Err(std::io::Error::other(format!(
+            "hook exceeded {ms} ms timeout, killed"
+        )));
+    }
+    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -744,11 +793,7 @@ unsafe fn child_run(
         if grand > 0 {
             // Intermediate: report grandchild pid (host ns) and exit.
             let bytes = (grand as i32).to_ne_bytes();
-            let _ = libc::write(
-                pid_relay_write,
-                bytes.as_ptr() as *const _,
-                bytes.len(),
-            );
+            let _ = libc::write(pid_relay_write, bytes.as_ptr() as *const _, bytes.len());
             libc::close(pid_relay_write);
             libc::_exit(0);
         }
@@ -803,7 +848,11 @@ unsafe fn child_run(
         let fstype_str = m.fstype.to_str().unwrap_or("");
         let data_str = m.data.as_ref().and_then(|c| c.to_str().ok());
 
-        let src_opt = if src_str.is_empty() { None } else { Some(src_str) };
+        let src_opt = if src_str.is_empty() {
+            None
+        } else {
+            Some(src_str)
+        };
         let fstype_opt = if fstype_str.is_empty() || fstype_str == "none" {
             None
         } else {
@@ -816,10 +865,7 @@ unsafe fn child_run(
         // freshly-detached mount tree; an already-attached bind would
         // be rejected. For non-idmap mounts we fall through to plain
         // mount(2) — the hot path is unchanged.
-        if !m.idmap_uid.is_empty()
-            && idx < idmap_userns_fds.len()
-            && idmap_userns_fds[idx] >= 0
-        {
+        if !m.idmap_uid.is_empty() && idx < idmap_userns_fds.len() && idmap_userns_fds[idx] >= 0 {
             if !apply_idmap_bind(&m.source, &m.target, idmap_userns_fds[idx]) {
                 child_die(err_fd, 130, b"idmapped bind mount failed");
             }
@@ -908,11 +954,7 @@ unsafe fn child_run(
         let r = libc::mknod(dev.path.as_ptr(), mode, rdev);
         if r < 0 {
             // Fallback: bind-mount host's same path.
-            let _ = libc::open(
-                dev.path.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT,
-                0o644,
-            );
+            let _ = libc::open(dev.path.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644);
             let _ = mount(
                 Some(std::str::from_utf8_unchecked(dev.path.as_bytes())),
                 std::str::from_utf8_unchecked(dev.path.as_bytes()),
@@ -942,7 +984,9 @@ unsafe fn child_run(
         // if it's a regular file, bind-mount /dev/null. We try /dev/null first;
         // if that fails (target is a dir), fall back to tmpfs.
         let r = mount(
-            Some(std::str::from_utf8_unchecked(&null_src[..null_src.len() - 1])),
+            Some(std::str::from_utf8_unchecked(
+                &null_src[..null_src.len() - 1],
+            )),
             std::str::from_utf8_unchecked(p.as_bytes()),
             Option::<&str>::None,
             MsFlags::MS_BIND,
@@ -1126,7 +1170,7 @@ unsafe fn child_run(
             filter: plan.ext.seccomp_bpf.as_ptr(),
         };
         let rc = libc::prctl(
-            22, /* PR_SET_SECCOMP */
+            22,   /* PR_SET_SECCOMP */
             2u64, /* SECCOMP_MODE_FILTER */
             &fprog as *const sock_fprog as u64,
             0u64,
@@ -1216,16 +1260,49 @@ unsafe fn run_hooks_unsafe(hooks: &[crate::plan::HookCmd], err_fd: i32) {
             // pipes state.json on stdin; in-container hooks see the
             // workload's stdin, which is the same fd inherited from
             // create.)
-            let mut argv: Vec<*const libc::c_char> =
-                h.args.iter().map(|c| c.as_ptr()).collect();
+            let mut argv: Vec<*const libc::c_char> = h.args.iter().map(|c| c.as_ptr()).collect();
             argv.push(std::ptr::null());
-            let mut envp: Vec<*const libc::c_char> =
-                h.env.iter().map(|c| c.as_ptr()).collect();
+            let mut envp: Vec<*const libc::c_char> = h.env.iter().map(|c| c.as_ptr()).collect();
             envp.push(std::ptr::null());
             libc::execve(h.path.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
         let mut status = 0i32;
+        // Optional pidfd-based timeout. timeout_ms == None means
+        // "wait indefinitely" (the pre-timeout behavior).
+        if let Some(ms) = h.timeout_ms {
+            const SYS_PIDFD_OPEN: libc::c_long = 434;
+            let pidfd = libc::syscall(SYS_PIDFD_OPEN, pid, 0u32) as i32;
+            if pidfd >= 0 {
+                let timeout = if ms > i32::MAX as u64 {
+                    i32::MAX
+                } else {
+                    ms as i32
+                };
+                let mut pfd = libc::pollfd {
+                    fd: pidfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut rc;
+                loop {
+                    rc = libc::poll(&mut pfd, 1, timeout);
+                    if rc >= 0 || *libc::__errno_location() != libc::EINTR {
+                        break;
+                    }
+                }
+                libc::close(pidfd);
+                if rc == 0 {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                    child_die(err_fd, 116, b"hook timeout, killed");
+                }
+                if rc < 0 {
+                    child_die(err_fd, 114, b"hook poll failed");
+                }
+            }
+            // pidfd_open failed → fall through to blocking waitpid.
+        }
         loop {
             let r = libc::waitpid(pid, &mut status, 0);
             if r >= 0 {
@@ -1264,9 +1341,16 @@ unsafe fn apply_capabilities(err_fd: i32, caps: &crate::plan::CapBitmasks) {
     // Now set inheritable, permitted, effective via capset(2).
     // capability v3 header + 2-word datap (low / high 32 bits each set).
     #[repr(C)]
-    struct CapHeader { version: u32, pid: i32 }
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
     #[repr(C)]
-    struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
 
     const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
     let header = CapHeader {
@@ -1285,11 +1369,7 @@ unsafe fn apply_capabilities(err_fd: i32, caps: &crate::plan::CapBitmasks) {
             inheritable: (caps.inheritable >> 32) as u32,
         },
     ];
-    let rc = libc::syscall(
-        libc::SYS_capset,
-        &header as *const _,
-        data.as_ptr(),
-    );
+    let rc = libc::syscall(libc::SYS_capset, &header as *const _, data.as_ptr());
     if rc < 0 {
         child_die(err_fd, 109, b"capset failed");
     }
@@ -1316,23 +1396,34 @@ unsafe fn apply_capabilities(err_fd: i32, caps: &crate::plan::CapBitmasks) {
 unsafe fn reapply_effective(err_fd: i32, caps: &crate::plan::CapBitmasks) {
     // First, query current capset to see what survived KEEPCAPS.
     #[repr(C)]
-    struct CapHeader { version: u32, pid: i32 }
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
     #[repr(C)]
-    struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
     const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
     let header = CapHeader {
         version: _LINUX_CAPABILITY_VERSION_3,
         pid: 0,
     };
     let mut got: [CapData; 2] = [
-        CapData { effective: 0, permitted: 0, inheritable: 0 },
-        CapData { effective: 0, permitted: 0, inheritable: 0 },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
     ];
-    let rc = libc::syscall(
-        libc::SYS_capget,
-        &header as *const _,
-        got.as_mut_ptr(),
-    );
+    let rc = libc::syscall(libc::SYS_capget, &header as *const _, got.as_mut_ptr());
     if rc < 0 {
         child_die(err_fd, 109, b"capget after setresuid failed");
     }
@@ -1353,11 +1444,7 @@ unsafe fn reapply_effective(err_fd: i32, caps: &crate::plan::CapBitmasks) {
             inheritable: (caps.inheritable >> 32) as u32,
         },
     ];
-    let rc = libc::syscall(
-        libc::SYS_capset,
-        &header as *const _,
-        new_data.as_ptr(),
-    );
+    let rc = libc::syscall(libc::SYS_capset, &header as *const _, new_data.as_ptr());
     if rc < 0 {
         child_die(err_fd, 109, b"reapply effective caps failed");
     }
@@ -1401,7 +1488,11 @@ unsafe fn apply_apparmor(err_fd: i32, profile: &CString) {
         );
     }
     if fd < 0 {
-        child_die(err_fd, 120, b"open apparmor attr failed (kernel module loaded?)");
+        child_die(
+            err_fd,
+            120,
+            b"open apparmor attr failed (kernel module loaded?)",
+        );
     }
     let w = libc::write(fd, buf.as_ptr() as *const _, n);
     libc::close(fd);
@@ -1423,7 +1514,11 @@ unsafe fn apply_selinux(err_fd: i32, label: &CString) {
         libc::O_WRONLY | libc::O_CLOEXEC,
     );
     if fd < 0 {
-        child_die(err_fd, 121, b"open selinux attr failed (kernel module loaded?)");
+        child_die(
+            err_fd,
+            121,
+            b"open selinux attr failed (kernel module loaded?)",
+        );
     }
     let w = libc::write(fd, lbl_bytes.as_ptr() as *const _, lbl_bytes.len());
     libc::close(fd);
@@ -1488,11 +1583,7 @@ fn spawn_idmap_helpers(mounts: &[crate::plan::MountOp]) -> std::io::Result<Vec<i
                     }
                 }
                 let one = b'1';
-                let _ = libc::write(
-                    sync_pipe[1],
-                    &one as *const u8 as *const _,
-                    1,
-                );
+                let _ = libc::write(sync_pipe[1], &one as *const u8 as *const _, 1);
                 libc::close(sync_pipe[1]);
                 // Park forever; parent will close the userns fd to
                 // release us, but we must keep the userns alive until
@@ -1505,9 +1596,7 @@ fn spawn_idmap_helpers(mounts: &[crate::plan::MountOp]) -> std::io::Result<Vec<i
         // Parent path.
         unsafe { libc::close(sync_pipe[1]) };
         let mut byte = [0u8; 1];
-        let n = unsafe {
-            libc::read(sync_pipe[0], byte.as_mut_ptr() as *mut _, 1)
-        };
+        let n = unsafe { libc::read(sync_pipe[0], byte.as_mut_ptr() as *mut _, 1) };
         unsafe { libc::close(sync_pipe[0]) };
         if n != 1 {
             // Helper failed before signaling. Reap it and continue
@@ -1519,9 +1608,7 @@ fn spawn_idmap_helpers(mounts: &[crate::plan::MountOp]) -> std::io::Result<Vec<i
         }
         let path = format!("/proc/{helper_pid}/ns/user");
         let path_c = std::ffi::CString::new(path).unwrap();
-        let fd = unsafe {
-            libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
-        };
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         // Don't kill the helper — `mount_setattr` needs a live
         // reference to the userns. The helper exits naturally when
         // the parent process group is cleaned up, or it's reparented
@@ -2066,9 +2153,7 @@ pub fn cmd_start(id: &str) -> std::io::Result<()> {
 
     // Open the FIFO write-side. The init process is blocked in read on the
     // other end; this unblocks it.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(paths.fifo())?;
+    let mut f = std::fs::OpenOptions::new().write(true).open(paths.fifo())?;
     f.write_all(b"S")?;
     drop(f);
 
@@ -2160,10 +2245,7 @@ pub fn cmd_state(id: &str) -> std::io::Result<()> {
         .and_then(|s| s.as_str())
         .unwrap_or("created")
         .to_string();
-    let pid = value
-        .get("pid")
-        .and_then(|p| p.as_i64())
-        .unwrap_or(0) as i32;
+    let pid = value.get("pid").and_then(|p| p.as_i64()).unwrap_or(0) as i32;
 
     // Once we've already recorded "stopped" we never go back. Otherwise check
     // whether the recorded init pid is still alive via /proc/<pid>/comm. We
@@ -2197,9 +2279,7 @@ fn is_init_alive(pid: i32, _comm_hint: Option<&str>) -> bool {
 fn read_comm_hint(paths: &ContainerPaths) -> Option<String> {
     let bytes = std::fs::read(paths.state_file()).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("commHint")
-        .and_then(|s| s.as_str())
-        .map(String::from)
+    v.get("commHint").and_then(|s| s.as_str()).map(String::from)
 }
 
 fn read_bundle(paths: &ContainerPaths) -> std::io::Result<PathBuf> {
@@ -2485,7 +2565,11 @@ fn parse_exec_process(path: &Path) -> std::io::Result<ExecProcess> {
     let env = v
         .get("env")
         .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let cwd = v
         .get("cwd")
@@ -2547,10 +2631,7 @@ fn parse_exec_process(path: &Path) -> std::io::Result<ExecProcess> {
         .filter(|s| !s.is_empty())
         .and_then(|s| CString::new(s).ok());
 
-    let terminal = v
-        .get("terminal")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
+    let terminal = v.get("terminal").and_then(|x| x.as_bool()).unwrap_or(false);
     Ok(ExecProcess {
         args,
         env,
@@ -2619,7 +2700,11 @@ unsafe fn exec_apply(pj: &ExecProcess) -> Result<(), i32> {
 /// `rsrun list` — list known containers in /run/rsrun. Used by Docker for
 /// orphan recovery on daemon restart (rare).
 pub fn cmd_list() -> std::io::Result<()> {
-    let root = ContainerPaths::for_id("dummy").root.parent().unwrap().to_path_buf();
+    let root = ContainerPaths::for_id("dummy")
+        .root
+        .parent()
+        .unwrap()
+        .to_path_buf();
     if !root.exists() {
         // Output empty TAB-separated table
         println!("ID\tPID\tSTATUS\tBUNDLE\tCREATED\tOWNER");
