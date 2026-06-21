@@ -9,6 +9,87 @@ For a comprehensive feature-by-feature comparison against crun, see
 [gaps-vs-crun.md](gaps-vs-crun.md). This file lists the priority order
 for what we'd implement next.
 
+## Production-readiness — what's still missing
+
+Honest framing of what would have to land before a Docker / containerd
+/ Kubernetes operator could safely use `--runtime=rsrun` in production.
+Items reference the per-feature detail in the Tier sections below.
+
+### M1 — won't silently break (~3 weeks)
+
+After M1, rsrun is safe to run on a single host where the operator can
+monitor it. Without these, real users will hit hangs or silently-wrong
+behavior with no diagnostic.
+
+- **Hook timeout enforcement**. A misbehaving CDI hook (NVIDIA GPU
+  plugin, etc.) currently hangs `docker run` indefinitely. Should
+  ship before recommending rsrun for any host that uses CDI plugins.
+  Tier 2 #6.
+- **`process.scheduler`**. K8s QoS classes (Guaranteed pods) rely on
+  `SCHED_RR` / `SCHED_DEADLINE` being honored. Without it the
+  scheduler thinks the pod has guarantees that aren't actually
+  applied. Tier 2 #9.
+- **Crash recovery between `create` and `start`**. If `rsrun create`
+  is killed between `clone3` and writing `state.json`, the orphan
+  init keeps running and `delete` can't clean it up. crun has
+  recovery logic; rsrun doesn't. ~80 LOC + a test plan. New.
+- **Multi-arch verification on x86_64**. ✅ Seccomp x86_64 syscall
+  table populated from kernel `syscall_64.tbl` v6.6 (365 names). All
+  other direct-syscall sites use `libc::SYS_*` (arch-correct) or
+  generic-table numbers shared between aarch64 and x86_64 (`clone3`,
+  `open_tree`, `move_mount`, `mount_setattr`). Remaining: end-to-end
+  test on an actual x86_64 host (CI matrix). Tracked under
+  Build/packaging.
+
+### M2 — works on the fleet (~6-8 weeks)
+
+After M2, rsrun is a defensible drop-in on the install bases that
+matter today: RHEL 8, Amazon Linux 2, K8s clusters with non-default
+scheduler classes, SELinux-enforcing hosts.
+
+- **cgroup v1**. ~25-40 % of running fleets depending on the survey.
+  Tier 1 #5.
+- **`linux.mountLabel`** propagation. Bind volumes on RHEL/Fedora
+  fail today. Tier 2 #10.
+- **`linux.sysctl` validation**. Misconfigured sysctls silently get
+  partial application. Tier 2 #7.
+- **Stats accuracy**. `cpu.stat` parsing is partial; `docker stats`
+  shows wrong CPU%. ~50 LOC. New.
+- **Race-free `docker exec --detach`**. Parent currently can return
+  before the child has fully execve'd. CI systems checking liveness
+  via `--pid-file` see false negatives. ~30 LOC. New.
+- **Structured logging**. rsrun emits a single line per error to
+  `--log`. Engines that ingest logs into ELK/Loki expect log levels
+  + structured fields. Tier 3.
+
+### M3 — stable v1 (open-ended)
+
+After M3, rsrun can claim parity with crun for everything Docker
+exercises in practice. Beyond M3 is parity with crun's full surface,
+which includes niche features that rarely matter in production
+(Intel RDT, NUMA memoryPolicy, personality, ioPriority).
+
+- CRIU integration (live migration / checkpoint).
+- AppArmor profile stacking (container-in-container).
+- Custom seccomp argument matching (per-syscall `args`).
+- `tmpcopyup` mount option (some K8s ConfigMap patterns).
+- Recursive mount propagation flags (`rro`, `rrw`, …).
+- Distro packaging, signed releases, supply-chain attestation.
+- CI pipeline running runtime-tools + youki contest harness on every
+  PR.
+
+### Status disclaimer for the README
+
+The README's "Status" section currently says "Not production-ready;
+some features are not yet thoroughly tested." Once the M1 list is
+clear, we can replace it with something specific:
+
+> rsrun runs the OCI lifecycle correctly on a single cgroup-v2 host
+> with Docker. It does not yet handle: cgroup-v1 hosts (RHEL 8, AL2),
+> runaway hooks, K8s QoS scheduler classes, crash recovery between
+> `create` and `start`, or SELinux mount labels. Don't run it under
+> containerd in production until M1 lands.
+
 ## Now in tree
 
 These don't affect the bench numbers because none of them touch the
@@ -121,6 +202,28 @@ Items affect real workloads but only under specific configurations.
     `rsuid` …) via `mount_setattr(MOUNT_ATTR_*, AT_RECURSIVE)`.
     Linux 5.12+. ~30 LOC.
 
+14. **Crash recovery between `create` and `start`**. If rsrun is
+    killed after `clone3` but before `state.json` is written, the
+    orphan init keeps running and there's no pid record for `delete`
+    to act on. crun's recovery path: scan `/run/rsrun/<id>/init.pid`
+    on `state` and infer "stopped" / "creating-orphaned". ~80 LOC plus
+    a kill-mid-create test. M1 blocker.
+
+15. **Stats accuracy**. `cmd_stats` reads `cpu.stat` but parses only
+    `usage_usec`; `system_usec` and `user_usec` are dropped, so
+    `docker stats` percent-CPU computations are wrong under load.
+    Also missing: `memory.events`, `pids.events`. ~50 LOC. M2 item.
+
+16. **Race-free `docker exec --detach`**. Today the parent returns
+    after `fork()` regardless of execve completion; if the child's
+    apply_capabilities or NNP step fails, the parent's caller sees
+    "success" with a child that's about to `_exit`. crun uses an
+    extra sync pipe so the parent only returns after `execve` is in
+    flight. ~30 LOC. M2 item.
+
+17. **Structured logging**. Replace the single-line error format with
+    a level + structured-fields emitter, JSON or logfmt. M2 item.
+
 ## Later
 
 - **`spec` subcommand** — generate a default `config.json`. Currently
@@ -147,9 +250,10 @@ Items affect real workloads but only under specific configurations.
 
 ## Build / packaging
 
-- **Multi-arch**: `clone3` syscall number hardcoded for arm64; the
-  seccomp x86_64 syscall table is not populated. Need to switch on
-  `target_arch`.
+- **Multi-arch CI**: source-level x86_64 + aarch64 are both wired
+  (seccomp tables populated for both, all other direct syscalls use
+  `libc::SYS_*` or generic-table numbers). Still missing: a CI job
+  that actually builds + runs the lifecycle on x86_64.
 - **Static musl build**: release binary links dynamically against
   glibc.
 - **Distro packaging**: Debian/Ubuntu .deb, Fedora/RHEL .rpm, AUR.

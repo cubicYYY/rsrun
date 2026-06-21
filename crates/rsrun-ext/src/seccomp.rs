@@ -201,7 +201,18 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(target_arch = "x86_64")]
+    fn known_syscall_names_resolve_on_x86_64() {
+        // Spot-check: read(0), write(1), execve(59), openat(257).
+        assert_eq!(syscall_nr_x86_64("read"), Some(0));
+        assert_eq!(syscall_nr_x86_64("write"), Some(1));
+        assert_eq!(syscall_nr_x86_64("execve"), Some(59));
+        assert_eq!(syscall_nr_x86_64("openat"), Some(257));
+        assert_eq!(syscall_nr_x86_64("clone3"), Some(435));
+        assert_eq!(syscall_nr_x86_64("not_a_real_syscall"), None);
+    }
+
+    #[test]
     fn small_allowlist_compiles_to_nontrivial_program() {
         let v = json!({
             "defaultAction": "SCMP_ACT_ERRNO",
@@ -215,6 +226,9 @@ mod tests {
         let prog = compile(Some(&v)).unwrap();
         // seccompiler emits at minimum: arch check (a few instrs) +
         // syscall-nr check per allowed syscall + ret allow + ret default.
+        // This now exercises the x86_64 table too — previously, an empty
+        // table on x86_64 silently produced a no-op filter (compile()
+        // returned an empty Vec in `if rules.is_empty()`).
         assert!(prog.len() >= 4);
     }
 }
