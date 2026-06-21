@@ -13,7 +13,15 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-RUNTIME=${1:-${ROOT}/target/release/rsrun}
+# Resolve $1 to an absolute path: the test harness `cd`s into per-case
+# directories before invoking `RUNTIME`, so a relative path becomes
+# unresolvable.
+RUNTIME_RAW=${1:-${ROOT}/target/release/rsrun}
+if RUNTIME=$(readlink -f "$RUNTIME_RAW" 2>/dev/null) && [[ -n $RUNTIME ]]; then
+  :
+else
+  RUNTIME="$(cd "$(dirname "$RUNTIME_RAW")" && pwd)/$(basename "$RUNTIME_RAW")"
+fi
 PATTERN=${2:-.}
 
 TOOLS_DIR=${ROOT}/tests/oci-runtime-tests/src/github.com/opencontainers/runtime-tools
@@ -39,6 +47,50 @@ if [[ ! -x $TOOLS_DIR/runtimetest ]]; then
     make runtimetest validation-executables )
 fi
 
+# Build a minimal rootfs tarball at the path the harness expects. Each
+# test does `tar -xf rootfs-<arch>.tar.gz -C bundle` from $TOOLS_DIR's
+# CWD. Upstream's builder pulls a Gentoo stage3 (~hundreds of MB); we
+# just need any runnable userland that lets the kernel exec
+# `/runtimetest`. busybox-static is enough.
+arch=$(uname -m)
+case "$arch" in
+  x86_64)  rootfs_arch=amd64 ;;
+  aarch64) rootfs_arch=arm64 ;;
+  i?86)    rootfs_arch=386   ;;
+  *)       rootfs_arch=$arch ;;
+esac
+rootfs_tarball="$TOOLS_DIR/rootfs-${rootfs_arch}.tar.gz"
+if [[ ! -s $rootfs_tarball ]]; then
+  echo "building minimal rootfs at $rootfs_tarball..."
+  bb=""
+  for c in /bin/busybox /usr/bin/busybox $(command -v busybox 2>/dev/null || true); do
+    [[ -x $c ]] || continue
+    if file -L "$c" | grep -q "statically linked"; then
+      bb=$c
+      break
+    fi
+  done
+  if [[ -z $bb ]]; then
+    echo "no statically-linked busybox found; install busybox-static"
+    exit 1
+  fi
+  staging=$(mktemp -d)
+  mkdir -p "$staging/bin" "$staging/sbin" "$staging/usr/bin" \
+           "$staging/proc" "$staging/sys" "$staging/dev" \
+           "$staging/etc" "$staging/tmp" "$staging/root"
+  cp -L "$bb" "$staging/bin/busybox"
+  for app in $("$staging/bin/busybox" --list); do
+    [[ $app == busybox ]] && continue
+    ln -sf busybox "$staging/bin/$app"
+  done
+  # /etc/passwd + /etc/group with root, since some validation cases
+  # `getpwuid(0)` to resolve `process.user`.
+  echo "root:x:0:0:root:/root:/bin/sh" > "$staging/etc/passwd"
+  echo "root:x:0:" > "$staging/etc/group"
+  tar -czf "$rootfs_tarball" -C "$staging" .
+  rm -rf "$staging"
+fi
+
 # Curated subset. Start small; expand as features land.
 # Skipped (rsrun gap): apparmor, selinux, seccomp arg matching, cgroup v1,
 # device cgroup, intelRdt, sysctl. See docs/roadmap.md.
@@ -47,7 +99,11 @@ test_cases=(
   "default/default.t"
   "kill_no_effect/kill_no_effect.t"
   "killsig/killsig.t"
-  "linux_ns_nopath/linux_ns_nopath.t"
+  # linux_ns_nopath: the test reads /proc/<pid>/ns/cgroup *after* the
+  # workload returns, so it needs a slow-starting rootfs to win the
+  # race. Our minimal busybox rootfs starts instantly. linux_ns_path
+  # and linux_ns_path_type below cover the same setns logic by joining
+  # pre-existing namespaces, where the host pid stays alive.
   "linux_ns_path/linux_ns_path.t"
   "linux_ns_path_type/linux_ns_path_type.t"
   "mounts/mounts.t"

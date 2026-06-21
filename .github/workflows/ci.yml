@@ -111,6 +111,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: oci-${{ matrix.arch }}
+      - name: Install busybox-static
+        # Used by oci_validation.sh to build a minimal rootfs tarball
+        # for the runtime-tools harness.
+        run: sudo apt-get update -qq && sudo apt-get install -y busybox-static
       - name: Build release binary
         run: cargo build --release --locked
       - name: Run runtime-tools validation
