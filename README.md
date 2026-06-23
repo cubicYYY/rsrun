@@ -151,7 +151,7 @@ Bug reports, design discussion, and patches are welcome. See
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 [opencontainers/runtime-tools]: https://github.com/opencontainers/runtime-tools
 [`seccompiler`]: https://github.com/firecracker-microvm/seccompiler

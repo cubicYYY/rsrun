@@ -77,4 +77,4 @@ Please do not open a public issue for security-sensitive bugs. See
 ## License
 
 By submitting a contribution you agree it will be licensed under the
-project's license (Apache-2.0).
+project's license (MIT).
