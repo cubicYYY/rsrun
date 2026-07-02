@@ -55,16 +55,17 @@ Most of this tier has now landed. The remaining gap is cgroup v1.
   priority, scheduler flags. Applied via `sched_setattr(2)`. Used by
   realtime workloads, latency-sensitive Kubernetes pods, audio /
   video containers.
-- **rsrun**: parsed-but-ignored.
+- **rsrun**: ✅ landed. Applied with `sched_setattr(2)` from the parent
+  after `clone3`; unknown policies and flags are rejected at parse time.
 
 ### Hook timeout enforcement
 - **crun**: `src/libcrun/container.c:817`
 - **What**: OCI hooks may declare a `timeout` (seconds); crun kills
   the hook process and fails the container start if it overruns.
-- **rsrun**: timeout field is parsed and persisted but **not
-  enforced** — a runaway hook hangs `create` forever. Hooks rarely
-  set a timeout in practice, but a misbehaving CDI hook will hang
-  containerd.
+- **rsrun**: ✅ landed for hooks that declare `timeout`, using
+  `pidfd_open` + `poll` where available, then `SIGKILL` + reap on
+  deadline. Hooks that omit `timeout` can still block, so runtime-level
+  operation timeouts remain an agent-runtime roadmap item.
 
 ### `linux.sysctl` conflict validation
 - **crun**: `src/libcrun/linux.c:3666`
@@ -163,9 +164,8 @@ ergonomics but rarely hit by engines.
 
 ## Build / packaging
 
-- **Multi-arch**: `clone3` syscall number is hardcoded for arm64; the
-  seccomp x86_64 syscall table for `seccompiler` is not populated by
-  rsrun's profile compiler. Need to switch on `target_arch`.
+- **Multi-arch**: ✅ landed for CI coverage. Unit tests, lifecycle
+  smoke tests, and runtime-tools validation run on x86_64 and aarch64.
 - **Static musl build**: rsrun's release binary links dynamically
   against glibc. crun ships static binaries for 8 architectures.
 - **Distro packaging**: no .deb / .rpm / AUR yet; users build from
@@ -178,21 +178,21 @@ check this list first. Most reports fall into one of:
 
 1. cgroup v1 host (Tier 1) → reboot with cgroup v2 unified or
    wait for v1 support.
-2. Idmapped mount on a rootless setup (Tier 1) → fall back to runc
-   for that container until rsrun ships idmap.
-3. K8s QoS scheduling not honored (Tier 2) → known gap; on the
-   roadmap.
-4. SELinux-enforcing host with bind-mounted volumes (Tier 2) → known
+2. SELinux-enforcing host with bind-mounted volumes (Tier 2) → known
    gap (`mountLabel` not propagated).
+3. Misconfigured `linux.sysctl` values (Tier 2) → current errors are
+   late or partial; parser-side conflict validation is still missing.
+4. Initial TTY size or recursive mount flags differ from crun (Tier 2)
+   → known compatibility gaps.
 
 Items above with concrete LOC estimates and crun line numbers are the
 ones we'd implement next, in roughly this order:
 
-1. `--preserve-fds` (~30 LOC)
-2. `--no-pivot` (~20 LOC)
-3. `process.oomScoreAdj` (~10 LOC)
-4. Hook timeout enforcement (~15 LOC)
-5. `linux.sysctl` conflict validation (~30 LOC)
-6. `process.consoleSize` (~10 LOC)
-7. cgroup v1 (~600 LOC; lower priority)
-8. idmapped mounts (~80 LOC; needs kernel ≥ 5.12 detection)
+1. `linux.sysctl` conflict validation (~30 LOC)
+2. `process.consoleSize` (~10 LOC)
+3. `linux.mountLabel` propagation (~40 LOC)
+4. `process.rlimits[].soft > hard` validation (~5 LOC)
+5. `tmpcopyup` mount option (~25 LOC)
+6. Recursive mount propagation flags (~30 LOC; kernel ≥ 5.12)
+7. cgroup v1 (~600 LOC; compatibility-driven)
+8. Static builds and distro packaging

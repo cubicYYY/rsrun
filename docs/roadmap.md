@@ -5,9 +5,48 @@ mounts, caps, exec). Heavier features live in `rsrun-ext`, all gated
 as default-on Cargo features so the binary can be slimmed by opting
 out.
 
-For a comprehensive feature-by-feature comparison against crun, see
-[gaps-vs-crun.md](gaps-vs-crun.md). This file lists the priority order
-for what we'd implement next.
+There are two roadmap tracks:
+
+- **Agent rollout runtime**: [SPEC.md](../SPEC.md) is the primary
+  direction for rollout workloads. It prioritizes repeated `exec`,
+  bounded failure, structured step results, and filesystem state
+  primitives.
+- **OCI / crun compatibility**: this file tracks drop-in runtime
+  production-readiness. For a feature-by-feature comparison against
+  crun, see [gaps-vs-crun.md](gaps-vs-crun.md).
+
+When these tracks conflict, optimize for the agent-runtime hot path
+unless a real Docker / containerd / Kubernetes workload proves the
+compatibility gap is blocking.
+
+## Agent-runtime priority
+
+These are the next implementation milestones for large-scale agent
+rollout use. They intentionally sit ahead of broad crun parity.
+
+### A1 — hardened agent step execution
+
+- First-class `rsrun exec <id> --timeout ... --json -- <cmd> ...`.
+- Separate stdout/stderr capture with deterministic truncation.
+- Whole-process-tree timeout cleanup, including cgroup cleanup.
+- JSON result with exit/signal, timeout, duration, CPU, memory, OOM,
+  and output truncation fields.
+
+### A2 — bounded runtime operations
+
+- Runtime-level timeouts for `create`, `start`, `delete`, unmount, and
+  cleanup paths.
+- Failed cleanup state that is visible to callers and recoverable by a
+  later cleanup pass.
+
+### A3 — validation and state primitives
+
+- `validate-bundle <bundle> --json` to reject unsupported bundles
+  before a rollout starts.
+- Overlay-backed writable rootfs mode for cheap reset and diff.
+- `changed-files`, `diff`, and `export-diff` for patch extraction.
+- Filesystem-level `snapshot`, `restore`, and `fork`; CRIU remains a
+  later optional path.
 
 ## Production-readiness — what's still missing
 
@@ -63,9 +102,9 @@ scheduler classes, SELinux-enforcing hosts.
 - **Race-free `docker exec --detach`**. Parent currently can return
   before the child has fully execve'd. CI systems checking liveness
   via `--pid-file` see false negatives. ~30 LOC. New.
-- **Structured logging**. rsrun emits a single line per error to
-  `--log`. Engines that ingest logs into ELK/Loki expect log levels
-  + structured fields. Tier 3.
+- **Richer structured logging**. `--log-format json` emits
+  Docker-compatible error lines today; production operators will want
+  structured warning/info/debug events with stable fields. Tier 3.
 
 ### M3 — stable v1 (open-ended)
 
@@ -91,10 +130,10 @@ some features are not yet thoroughly tested." Once the M1 list is
 clear, we can replace it with something specific:
 
 > rsrun runs the OCI lifecycle correctly on a single cgroup-v2 host
-> with Docker. M1 is complete on aarch64; outstanding before
-> production-on-containerd: cgroup-v1 hosts (RHEL 8, AL2) and SELinux
-> mount labels (both M2). x86_64 source builds clean; CI matrix run
-> still pending.
+> with Docker. M1 is complete on aarch64 and x86_64 in CI;
+> outstanding before production-on-containerd: cgroup-v1 hosts
+> (RHEL 8, AL2), SELinux mount labels, sysctl validation, stats
+> accuracy, and race-free detached exec.
 
 ## Now in tree
 
@@ -230,8 +269,9 @@ Items affect real workloads but only under specific configurations.
     extra sync pipe so the parent only returns after `execve` is in
     flight. ~30 LOC. M2 item.
 
-17. **Structured logging**. Replace the single-line error format with
-    a level + structured-fields emitter, JSON or logfmt. M2 item.
+17. **Richer structured logging**. `--log-format json` supports
+    Docker-compatible error output today. Add stable structured fields
+    for warning/info/debug events and internal operation timing. M2 item.
 
 ## Later
 
@@ -252,8 +292,9 @@ Items affect real workloads but only under specific configurations.
 - **CRIU** checkpoint / restore.
 - **WASM workloads** — youki has it; out of scope for now.
 - **Annotations passthrough** into hook env vars.
-- **Log levels / structured logging** — rsrun emits plain or JSON
-  error-only.
+- **Richer log levels / structured logging** — rsrun emits plain or
+  Docker-compatible JSON error lines today; broader structured events
+  are still missing.
 - **Per-container network setup** (CNI / built-in bridge) — engine
   territory; rsrun sets the netns flag and stops there.
 
