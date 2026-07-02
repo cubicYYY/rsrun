@@ -27,6 +27,28 @@ scripts/oci_validation.sh           # OCI runtime-tools (16/16)
 scripts/bench.sh crun youki runc    # hyperfine comparison
 ```
 
+On macOS, always run build and test commands after entering the Lima
+shell; running `cargo build` directly on the host is expected to fail.
+A typical smoke-test loop is:
+
+```sh
+limactl shell bench
+cd /path/to/rsrun
+sudo apt-get update
+sudo apt-get install -y busybox-static
+cargo build --release
+cargo test --workspace --all-features --locked
+sudo -E bash scripts/smoke.sh target/release/rsrun
+```
+
+Use the same Lima shell for OCI validation:
+
+```sh
+limactl shell bench
+cd /path/to/rsrun
+bash scripts/oci_validation.sh target/release/rsrun
+```
+
 `bash scripts/install-hooks.sh` installs a pre-commit hook that runs
 `cargo fmt --all -- --check` on staged Rust files. CI rejects unformatted
 PRs, so installing the hook avoids round-trips.

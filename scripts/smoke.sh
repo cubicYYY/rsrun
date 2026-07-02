@@ -161,6 +161,18 @@ else
   check "policy is SCHED_BATCH (3)" "[[ $policy == 3 ]]"
   check "nice is 7"                 "[[ $nice == 7 ]]"
 fi
+agent_json=$WORK/agent-exec.json
+$SUDO $RUNTIME --root $WORK/state.sched exec \
+  --timeout 2s --kill-tree --max-output-bytes 5 --json \
+  c3 -- /bin/sh -c 'printf stdout-long; printf stderr-long >&2' > "$agent_json"
+check "agent exec captures stdout/stderr with truncation" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$agent_json\")); sys.exit(0 if j[\"exit_code\"] == 0 and j[\"stdout\"] == \"stdou\" and j[\"stderr\"] == \"stder\" and j[\"stdout_truncated\"] and j[\"stderr_truncated\"] else 1)'"
+timeout_json=$WORK/agent-timeout.json
+$SUDO $RUNTIME --root $WORK/state.sched exec \
+  --timeout 200ms --kill-tree --json \
+  c3 -- /bin/sh -c 'sleep 5' > "$timeout_json"
+check "agent exec reports timeout" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$timeout_json\")); sys.exit(0 if j[\"timeout\"] is True and j[\"duration_ms\"] < 5000 else 1)'"
 $SUDO $RUNTIME --root $WORK/state.sched delete -f c3
 
 # ── 4. crash recovery ──────────────────────────────────────────────────

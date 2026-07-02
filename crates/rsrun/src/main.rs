@@ -3,6 +3,7 @@
 use rsrun_core as runtime;
 
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -40,6 +41,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Create a container from an OCI bundle. Init blocks until `start`.
     Create {
@@ -79,13 +81,29 @@ enum Cmd {
         signal: String,
     },
     /// Run a process inside a running container (the CVE-2019-5736 path).
+    #[command(trailing_var_arg = true)]
     Exec {
         #[arg(short = 'p', long)]
-        process: PathBuf,
+        process: Option<PathBuf>,
         #[arg(long = "pid-file")]
         pid_file: Option<PathBuf>,
         #[arg(short, long)]
         detach: bool,
+        /// Agent mode: maximum wall time before terminating the exec.
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Agent mode: signal the exec process group on timeout.
+        #[arg(long = "kill-tree")]
+        kill_tree: bool,
+        /// Agent mode: per-stream captured output limit.
+        #[arg(long = "max-output-bytes", default_value_t = 2 * 1024 * 1024)]
+        max_output_bytes: usize,
+        /// Agent mode: emit a structured result object.
+        #[arg(long)]
+        json: bool,
+        /// Agent mode: read stdin payload from a file, or `-` for stdin.
+        #[arg(long)]
+        stdin: Option<PathBuf>,
         // Args below accepted for engine compatibility but unused here.
         #[arg(short, long)]
         _tty: bool,
@@ -96,9 +114,9 @@ enum Cmd {
         #[arg(short, long)]
         _user: Option<String>,
         #[arg(long)]
-        _cwd: Option<String>,
+        cwd: Option<String>,
         #[arg(short, long)]
-        _env: Vec<String>,
+        env: Vec<String>,
         #[arg(long = "additional-gids")]
         _additional_gids: Option<String>,
         #[arg(long)]
@@ -110,6 +128,8 @@ enum Cmd {
         #[arg(long = "preserve-fds")]
         _preserve_fds: Option<String>,
         id: String,
+        /// Agent mode command. Use `--` before the command.
+        command: Vec<String>,
     },
     /// Emit the runtime feature descriptor JSON Docker queries at registration.
     Features,
@@ -202,14 +222,53 @@ fn main() -> ExitCode {
             detach,
             id,
             console_socket,
+            timeout,
+            kill_tree,
+            max_output_bytes,
+            json,
+            stdin,
+            cwd,
+            env,
+            command,
             ..
-        } => runtime::cmd_exec_full(
-            &id,
-            &process,
-            pid_file.as_deref(),
-            detach,
-            console_socket.as_deref(),
-        ),
+        } => (|| -> std::io::Result<()> {
+            if !command.is_empty() {
+                if detach {
+                    Err(std::io::Error::other(
+                        "agent exec command form does not support --detach",
+                    ))
+                } else if console_socket.is_some() {
+                    Err(std::io::Error::other(
+                        "agent exec command form does not support --console-socket",
+                    ))
+                } else {
+                    let opts = runtime::AgentExecOpts {
+                        timeout_ms: match timeout.as_deref() {
+                            Some(s) => Some(parse_duration_ms(s)?),
+                            None => None,
+                        },
+                        kill_tree,
+                        max_output_bytes,
+                        cwd,
+                        env,
+                        json,
+                        stdin: read_exec_stdin(stdin.as_deref())?,
+                    };
+                    runtime::cmd_exec_agent(&id, &command, opts)
+                }
+            } else {
+                let process = process.ok_or_else(|| {
+                    std::io::Error::other("exec requires either -p/--process or a command after --")
+                })?;
+                runtime::cmd_exec_full(
+                    &id,
+                    &process,
+                    pid_file.as_deref(),
+                    detach,
+                    console_socket.as_deref(),
+                )
+            }
+        })(),
         Cmd::Features => sub_features(),
         Cmd::List => runtime::cmd_list(),
         Cmd::Spec => Err(std::io::Error::other("spec subcommand not implemented")),
@@ -265,6 +324,40 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn parse_duration_ms(s: &str) -> std::io::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(std::io::Error::other("empty duration"));
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else {
+        (s, 1_000)
+    };
+    let value = num
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::other(format!("bad duration: {s}")))?;
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| std::io::Error::other(format!("duration too large: {s}")))
+}
+
+fn read_exec_stdin(path: Option<&std::path::Path>) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if path == std::path::Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        return Ok(Some(buf));
+    }
+    std::fs::read(path).map(Some)
 }
 
 fn sub_features() -> std::io::Result<()> {

@@ -62,6 +62,7 @@ use std::ffi::CString;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub fn cmd_create(id: &str, bundle: &Path, pid_file: Option<&Path>) -> std::io::Result<()> {
     cmd_create_with_ext(id, bundle, pid_file, crate::plan::ExtPlan::default())
@@ -2487,6 +2488,52 @@ pub fn cmd_exec_full(
     detach: bool,
     console_socket: Option<&Path>,
 ) -> std::io::Result<()> {
+    let pj = parse_exec_process(process_json)?;
+    run_exec_process(id, pj, pid_file, detach, console_socket, None)
+}
+
+/// Options for the agent-oriented direct-command exec mode. This is
+/// intentionally separate from OCI `exec -p process.json`: engines keep
+/// their existing behavior, while rollout workers get a step primitive
+/// with bounded output, timeout, and machine-readable results.
+pub struct AgentExecOpts {
+    pub timeout_ms: Option<u64>,
+    pub kill_tree: bool,
+    pub max_output_bytes: usize,
+    pub cwd: Option<String>,
+    pub env: Vec<String>,
+    pub json: bool,
+    pub stdin: Option<Vec<u8>>,
+}
+
+pub fn cmd_exec_agent(id: &str, args: &[String], opts: AgentExecOpts) -> std::io::Result<()> {
+    if args.is_empty() {
+        return Err(std::io::Error::other("exec: missing command"));
+    }
+    let pj = ExecProcess {
+        args: args.to_vec(),
+        env: opts.env.clone(),
+        cwd: opts.cwd.clone().unwrap_or_else(|| "/".to_string()),
+        uid: 0,
+        gid: 0,
+        additional_gids: Vec::new(),
+        no_new_privileges: false,
+        capabilities: None,
+        apparmor_profile: None,
+        selinux_label: None,
+        terminal: false,
+    };
+    run_exec_process(id, pj, None, false, None, Some(opts))
+}
+
+fn run_exec_process(
+    id: &str,
+    pj: ExecProcess,
+    pid_file: Option<&Path>,
+    detach: bool,
+    console_socket: Option<&Path>,
+    agent: Option<AgentExecOpts>,
+) -> std::io::Result<()> {
     // CVE-2019-5736 mitigation: prctl(PR_SET_DUMPABLE, 0).
     set_undumpable();
 
@@ -2505,7 +2552,23 @@ pub fn cmd_exec_full(
         )));
     }
 
-    let pj = parse_exec_process(process_json)?;
+    let mut cgroup_fd = -1;
+    let cgroup_path = format!("/sys/fs/cgroup/rsrun-{id}");
+    if agent.is_some() {
+        if let Ok(c) = CString::new(cgroup_path.as_str()) {
+            cgroup_fd = unsafe {
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+        }
+    }
+    let stats_before = if cgroup_fd >= 0 {
+        read_cgroup_sample(cgroup_fd)
+    } else {
+        CgroupSample::default()
+    };
 
     // PTY allocation, when the spec sets terminal:true AND the engine
     // gave us a console socket. Both fds stay -1 otherwise.
@@ -2538,9 +2601,35 @@ pub fn cmd_exec_full(
         unsafe { libc::close(*fd) };
     }
 
+    let mut stdout_pipe = [-1i32; 2];
+    let mut stderr_pipe = [-1i32; 2];
+    let mut stdin_pipe = [-1i32; 2];
+    if agent.is_some() {
+        if unsafe { libc::pipe2(stdout_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::pipe2(stderr_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0
+        {
+            close_pair(stdout_pipe);
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::pipe2(stdin_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+            close_pair(stdout_pipe);
+            close_pair(stderr_pipe);
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
     // Fork to enter the PID namespace.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        close_pair(stdout_pipe);
+        close_pair(stderr_pipe);
+        close_pair(stdin_pipe);
+        if cgroup_fd >= 0 {
+            unsafe { libc::close(cgroup_fd) };
+        }
         return Err(std::io::Error::last_os_error());
     }
     if pid > 0 {
@@ -2548,12 +2637,50 @@ pub fn cmd_exec_full(
         if pty_slave_fd >= 0 {
             unsafe { libc::close(pty_slave_fd) };
         }
+        if agent.is_some() {
+            unsafe {
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[1]);
+                libc::close(stdin_pipe[0]);
+            }
+        }
         if let (Some(socket), true) = (console_socket, pty_master_fd >= 0) {
             send_pty_master(socket, pty_master_fd)?;
             unsafe { libc::close(pty_master_fd) };
         }
         if let Some(pf) = pid_file {
             std::fs::write(pf, pid.to_string())?;
+        }
+        if cgroup_fd >= 0 {
+            let _ = write_cgroup_file(cgroup_fd, "cgroup.procs", pid.to_string().as_bytes());
+        }
+        if let Some(agent_opts) = agent {
+            let result = wait_agent_exec(
+                id,
+                pid,
+                cgroup_fd,
+                stats_before,
+                stdout_pipe[0],
+                stderr_pipe[0],
+                stdin_pipe[1],
+                &agent_opts,
+            )?;
+            if cgroup_fd >= 0 {
+                unsafe { libc::close(cgroup_fd) };
+            }
+            let ok = result.exit_code == Some(0) && !result.timeout;
+            emit_agent_exec_result(&result, agent_opts.json)?;
+            return if agent_opts.json || ok {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "exec: {}",
+                    result.failure_summary()
+                )))
+            };
+        }
+        if cgroup_fd >= 0 {
+            unsafe { libc::close(cgroup_fd) };
         }
         if detach {
             return Ok(());
@@ -2576,6 +2703,27 @@ pub fn cmd_exec_full(
     // child_run (groups → caps → user transition → NNP → LSM staging).
     // On failure we _exit(non-zero) so the parent's waitpid surfaces it.
     unsafe {
+        if agent.is_some() {
+            libc::close(stdout_pipe[0]);
+            libc::close(stderr_pipe[0]);
+            libc::close(stdin_pipe[1]);
+            if libc::dup2(stdin_pipe[0], 0) < 0
+                || libc::dup2(stdout_pipe[1], 1) < 0
+                || libc::dup2(stderr_pipe[1], 2) < 0
+            {
+                libc::_exit(119);
+            }
+            clear_nonblock(0);
+            clear_nonblock(1);
+            clear_nonblock(2);
+            libc::close(stdin_pipe[0]);
+            libc::close(stdout_pipe[1]);
+            libc::close(stderr_pipe[1]);
+            let _ = libc::setpgid(0, 0);
+        }
+        if cgroup_fd >= 0 {
+            libc::close(cgroup_fd);
+        }
         // Close the parent's master end (we kept it for sending). Slave
         // becomes our controlling terminal + stdio.
         if pty_master_fd >= 0 {
@@ -2630,6 +2778,397 @@ pub fn cmd_exec_full(
             libc::execvpe(argv0.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
         }
         libc::_exit(127);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct CgroupSample {
+    cpu_usage_usec: u64,
+    memory_current: u64,
+    memory_peak: u64,
+    oom: u64,
+    oom_kill: u64,
+}
+
+struct CapturedStream {
+    data: Vec<u8>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl CapturedStream {
+    fn new(limit: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            bytes: 0,
+            truncated: false,
+        }
+        .with_capacity(limit)
+    }
+
+    fn with_capacity(mut self, limit: usize) -> Self {
+        self.data.reserve(limit.min(8192));
+        self
+    }
+
+    fn push(&mut self, chunk: &[u8], limit: usize) {
+        self.bytes += chunk.len();
+        if self.data.len() < limit {
+            let remaining = limit - self.data.len();
+            let take = remaining.min(chunk.len());
+            self.data.extend_from_slice(&chunk[..take]);
+        }
+        if self.bytes > limit {
+            self.truncated = true;
+        }
+    }
+}
+
+struct AgentExecResult {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    timeout: bool,
+    duration_ms: u128,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+    cpu_ms: u64,
+    max_rss_bytes: u64,
+    oom_killed: bool,
+}
+
+impl AgentExecResult {
+    fn failure_summary(&self) -> String {
+        if self.timeout {
+            "timeout".to_string()
+        } else if let Some(sig) = self.signal {
+            format!("signal {sig}")
+        } else {
+            format!("exit {}", self.exit_code.unwrap_or(1))
+        }
+    }
+}
+
+fn wait_agent_exec(
+    id: &str,
+    pid: libc::pid_t,
+    cgroup_fd: i32,
+    stats_before: CgroupSample,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    stdin_fd: i32,
+    opts: &AgentExecOpts,
+) -> std::io::Result<AgentExecResult> {
+    let start = Instant::now();
+    let timeout = opts.timeout_ms.map(Duration::from_millis);
+    let stdin = opts.stdin.as_deref().unwrap_or(&[]);
+    let mut stdin_pos = 0usize;
+    let mut stdin_open = stdin_fd >= 0;
+    let mut out_fd = stdout_fd;
+    let mut err_fd = stderr_fd;
+    let mut stdout = CapturedStream::new(opts.max_output_bytes);
+    let mut stderr = CapturedStream::new(opts.max_output_bytes);
+    let mut status: Option<i32> = None;
+    let mut timed_out = false;
+    let mut term_sent_at: Option<Instant> = None;
+    let mut kill_sent = false;
+
+    if stdin.is_empty() && stdin_open {
+        unsafe { libc::close(stdin_fd) };
+        stdin_open = false;
+    }
+
+    loop {
+        if out_fd >= 0 {
+            read_stream_available(&mut out_fd, &mut stdout, opts.max_output_bytes)?;
+        }
+        if err_fd >= 0 {
+            read_stream_available(&mut err_fd, &mut stderr, opts.max_output_bytes)?;
+        }
+        if stdin_open {
+            write_stdin_available(stdin_fd, stdin, &mut stdin_pos, &mut stdin_open)?;
+        }
+
+        if status.is_none() {
+            let mut st = 0i32;
+            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+            if r == pid {
+                status = Some(st);
+            } else if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    status = Some(0);
+                }
+            }
+        }
+
+        if status.is_some() && out_fd < 0 && err_fd < 0 && !stdin_open {
+            break;
+        }
+
+        if status.is_none() {
+            if let Some(limit) = timeout {
+                if !timed_out && start.elapsed() >= limit {
+                    timed_out = true;
+                    term_sent_at = Some(Instant::now());
+                    kill_exec_tree(id, pid, cgroup_fd, opts.kill_tree, libc::SIGTERM);
+                }
+                if timed_out
+                    && !kill_sent
+                    && term_sent_at
+                        .map(|t| t.elapsed() >= Duration::from_millis(100))
+                        .unwrap_or(false)
+                {
+                    kill_sent = true;
+                    kill_exec_tree(id, pid, cgroup_fd, opts.kill_tree, libc::SIGKILL);
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    if out_fd >= 0 {
+        unsafe { libc::close(out_fd) };
+    }
+    if err_fd >= 0 {
+        unsafe { libc::close(err_fd) };
+    }
+    if stdin_open {
+        unsafe { libc::close(stdin_fd) };
+    }
+
+    let stats_after = if cgroup_fd >= 0 {
+        read_cgroup_sample(cgroup_fd)
+    } else {
+        CgroupSample::default()
+    };
+    let st = status.unwrap_or(0);
+    let exit_code = if libc::WIFEXITED(st) {
+        Some(libc::WEXITSTATUS(st))
+    } else {
+        None
+    };
+    let signal = if libc::WIFSIGNALED(st) {
+        Some(libc::WTERMSIG(st))
+    } else {
+        None
+    };
+    let cpu_ms = stats_after
+        .cpu_usage_usec
+        .saturating_sub(stats_before.cpu_usage_usec)
+        / 1000;
+    let max_rss_bytes = stats_after
+        .memory_peak
+        .max(stats_after.memory_current)
+        .max(stats_before.memory_peak);
+    let oom_killed =
+        stats_after.oom_kill > stats_before.oom_kill || stats_after.oom > stats_before.oom;
+
+    Ok(AgentExecResult {
+        exit_code,
+        signal,
+        timeout: timed_out,
+        duration_ms: start.elapsed().as_millis(),
+        stdout,
+        stderr,
+        cpu_ms,
+        max_rss_bytes,
+        oom_killed,
+    })
+}
+
+fn emit_agent_exec_result(result: &AgentExecResult, json: bool) -> std::io::Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "exit_code": result.exit_code,
+            "signal": result.signal,
+            "timeout": result.timeout,
+            "duration_ms": result.duration_ms,
+            "stdout": String::from_utf8_lossy(&result.stdout.data),
+            "stderr": String::from_utf8_lossy(&result.stderr.data),
+            "stdout_bytes": result.stdout.bytes,
+            "stderr_bytes": result.stderr.bytes,
+            "stdout_truncated": result.stdout.truncated,
+            "stderr_truncated": result.stderr.truncated,
+            "cpu_ms": result.cpu_ms,
+            "max_rss_bytes": result.max_rss_bytes,
+            "oom_killed": result.oom_killed,
+        });
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+    std::io::stdout().write_all(&result.stdout.data)?;
+    std::io::stderr().write_all(&result.stderr.data)?;
+    Ok(())
+}
+
+fn read_stream_available(
+    fd: &mut i32,
+    stream: &mut CapturedStream,
+    limit: usize,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = unsafe { libc::read(*fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n > 0 {
+            stream.push(&buf[..n as usize], limit);
+            continue;
+        }
+        if n == 0 {
+            unsafe { libc::close(*fd) };
+            *fd = -1;
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted
+        {
+            return Ok(());
+        }
+        unsafe { libc::close(*fd) };
+        *fd = -1;
+        return Err(e);
+    }
+}
+
+fn write_stdin_available(
+    fd: i32,
+    stdin: &[u8],
+    pos: &mut usize,
+    open: &mut bool,
+) -> std::io::Result<()> {
+    while *pos < stdin.len() {
+        let chunk = &stdin[*pos..];
+        let n = unsafe { libc::write(fd, chunk.as_ptr() as *const _, chunk.len()) };
+        if n > 0 {
+            *pos += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted
+        {
+            return Ok(());
+        }
+        unsafe { libc::close(fd) };
+        *open = false;
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(e);
+    }
+    unsafe { libc::close(fd) };
+    *open = false;
+    Ok(())
+}
+
+fn kill_exec_tree(id: &str, pid: libc::pid_t, cgroup_fd: i32, kill_tree: bool, signal: i32) {
+    unsafe {
+        if kill_tree {
+            let _ = libc::kill(-pid, signal);
+        }
+        let _ = libc::kill(pid, signal);
+    }
+    if signal == libc::SIGKILL && kill_tree {
+        let contents = if cgroup_fd >= 0 {
+            read_cgroup_file(cgroup_fd, "cgroup.procs")
+        } else {
+            std::fs::read_to_string(format!("/sys/fs/cgroup/rsrun-{id}/cgroup.procs"))
+                .unwrap_or_default()
+        };
+        for line in contents.lines() {
+            if let Ok(p) = line.trim().parse::<libc::pid_t>() {
+                if p != pid {
+                    unsafe {
+                        let _ = libc::kill(p, signal);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn close_pair(pair: [i32; 2]) {
+    for fd in pair {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+unsafe fn clear_nonblock(fd: i32) {
+    let flags = libc::fcntl(fd, libc::F_GETFL);
+    if flags >= 0 {
+        let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+}
+
+fn read_cgroup_sample(dir_fd: i32) -> CgroupSample {
+    let cpu = read_cgroup_file(dir_fd, "cpu.stat");
+    let mem_events = read_cgroup_file(dir_fd, "memory.events");
+    CgroupSample {
+        cpu_usage_usec: parse_cgroup_key(&cpu, "usage_usec"),
+        memory_current: read_cgroup_file(dir_fd, "memory.current")
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        memory_peak: read_cgroup_file(dir_fd, "memory.peak")
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        oom: parse_cgroup_key(&mem_events, "oom"),
+        oom_kill: parse_cgroup_key(&mem_events, "oom_kill"),
+    }
+}
+
+fn parse_cgroup_key(s: &str, key: &str) -> u64 {
+    s.lines()
+        .find_map(|line| {
+            let (k, v) = line.split_once(' ')?;
+            if k == key {
+                v.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn read_cgroup_file(dir_fd: i32, name: &str) -> String {
+    let Ok(c_name) = CString::new(name) else {
+        return String::new();
+    };
+    let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+        } else {
+            break;
+        }
+    }
+    unsafe { libc::close(fd) };
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn write_cgroup_file(dir_fd: i32, name: &str, data: &[u8]) -> std::io::Result<()> {
+    let c_name = CString::new(name).map_err(|_| std::io::Error::other("cgroup file NUL"))?;
+    let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+    unsafe { libc::close(fd) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

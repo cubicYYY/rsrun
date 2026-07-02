@@ -22,8 +22,8 @@ pub mod state;
 mod runtime;
 
 pub use runtime::{
-    cmd_create, cmd_create_full, cmd_create_with_ext, cmd_delete, cmd_exec, cmd_exec_full,
-    cmd_kill, cmd_list, cmd_start, cmd_state,
+    cmd_create, cmd_create_full, cmd_create_with_ext, cmd_delete, cmd_exec, cmd_exec_agent,
+    cmd_exec_full, cmd_kill, cmd_list, cmd_start, cmd_state, AgentExecOpts,
 };
 
 #[cfg(feature = "update")]
