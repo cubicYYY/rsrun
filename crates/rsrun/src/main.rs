@@ -62,14 +62,25 @@ enum Cmd {
         /// read-only rootfs setups where pivot_root would fail.
         #[arg(long = "no-pivot")]
         no_pivot: bool,
+        /// Bound create, including parent-side hooks.
+        #[arg(long)]
+        timeout: Option<String>,
         id: String,
     },
     /// Unblock the created container; the workload begins running.
-    Start { id: String },
+    Start {
+        /// Bound start, including parent-side poststart hooks.
+        #[arg(long)]
+        timeout: Option<String>,
+        id: String,
+    },
     /// Stop the container (if `--force`) and remove its state.
     Delete {
         #[arg(short, long)]
         force: bool,
+        /// Bound delete, including poststop hooks and cleanup.
+        #[arg(long)]
+        timeout: Option<String>,
         id: String,
     },
     /// Print the OCI state document for the container.
@@ -133,6 +144,12 @@ enum Cmd {
     },
     /// Emit the runtime feature descriptor JSON Docker queries at registration.
     Features,
+    /// Check whether an OCI bundle is supported before running it.
+    ValidateBundle {
+        bundle: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// List known containers.
     List,
     /// Not implemented.
@@ -203,17 +220,23 @@ fn main() -> ExitCode {
             console_socket,
             preserve_fds,
             no_pivot,
+            timeout,
             id,
-        } => create_with_ext(
-            &id,
-            &bundle,
-            pid_file.as_deref(),
-            console_socket.as_deref(),
-            preserve_fds.unwrap_or(0),
-            no_pivot,
-        ),
-        Cmd::Start { id } => runtime::cmd_start(&id),
-        Cmd::Delete { force, id } => runtime::cmd_delete(&id, force),
+        } => parse_optional_duration_ms(timeout.as_deref()).and_then(|timeout_ms| {
+            create_with_ext(
+                &id,
+                &bundle,
+                pid_file.as_deref(),
+                console_socket.as_deref(),
+                preserve_fds.unwrap_or(0),
+                no_pivot,
+                timeout_ms,
+            )
+        }),
+        Cmd::Start { timeout, id } => parse_optional_duration_ms(timeout.as_deref())
+            .and_then(|timeout_ms| runtime::cmd_start_with_timeout(&id, timeout_ms)),
+        Cmd::Delete { force, timeout, id } => parse_optional_duration_ms(timeout.as_deref())
+            .and_then(|timeout_ms| runtime::cmd_delete_with_timeout(&id, force, timeout_ms)),
         Cmd::State { id } => runtime::cmd_state(&id),
         Cmd::Kill { id, signal } => runtime::cmd_kill(&id, &signal),
         Cmd::Exec {
@@ -270,6 +293,7 @@ fn main() -> ExitCode {
             }
         })(),
         Cmd::Features => sub_features(),
+        Cmd::ValidateBundle { bundle, json } => validate_bundle(&bundle, json),
         Cmd::List => runtime::cmd_list(),
         Cmd::Spec => Err(std::io::Error::other("spec subcommand not implemented")),
         #[cfg(feature = "pause")]
@@ -348,6 +372,10 @@ fn parse_duration_ms(s: &str) -> std::io::Result<u64> {
         .ok_or_else(|| std::io::Error::other(format!("duration too large: {s}")))
 }
 
+fn parse_optional_duration_ms(s: Option<&str>) -> std::io::Result<Option<u64>> {
+    s.map(parse_duration_ms).transpose()
+}
+
 fn read_exec_stdin(path: Option<&std::path::Path>) -> std::io::Result<Option<Vec<u8>>> {
     let Some(path) = path else {
         return Ok(None);
@@ -358,6 +386,213 @@ fn read_exec_stdin(path: Option<&std::path::Path>) -> std::io::Result<Option<Vec
         return Ok(Some(buf));
     }
     std::fs::read(path).map(Some)
+}
+
+fn validate_bundle(bundle: &std::path::Path, json: bool) -> std::io::Result<()> {
+    let canonical = bundle.canonicalize()?;
+    let config_path = canonical.join("config.json");
+    let mut reasons = Vec::new();
+
+    match rsrun_core::spec::Spec::from_bundle(&canonical) {
+        Ok(spec) => {
+            if let Err(e) = rsrun_ext::compile(&spec, "validate") {
+                reasons.push(format!("extension plan compile failed: {e}"));
+            }
+        }
+        Err(e) => reasons.push(format!("config.json is not supported: {e}")),
+    }
+
+    let value = match std::fs::read(&config_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    {
+        Some(value) => value,
+        None => {
+            reasons.push("config.json is missing or invalid JSON".to_string());
+            serde_json::Value::Null
+        }
+    };
+    collect_validation_reasons(&value, &mut reasons);
+
+    let supported = reasons.is_empty();
+    if json {
+        let out = serde_json::json!({
+            "supported": supported,
+            "reasons": reasons,
+            "safe_to_fallback": !supported,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+    } else if supported {
+        println!("supported");
+    } else {
+        println!("unsupported");
+        for reason in &reasons {
+            println!("- {reason}");
+        }
+    }
+
+    if supported {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("bundle is not fully supported"))
+    }
+}
+
+fn collect_validation_reasons(value: &serde_json::Value, reasons: &mut Vec<String>) {
+    let linux = value.get("linux").unwrap_or(&serde_json::Value::Null);
+    if linux.get("resources").is_some()
+        && !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    {
+        reasons.push("cgroup v2 is not available on this host".to_string());
+    }
+    if linux
+        .get("mountLabel")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        reasons.push("linux.mountLabel is not supported".to_string());
+    }
+    for key in ["intelRdt", "memoryPolicy", "timeOffsets"] {
+        if linux.get(key).is_some() {
+            reasons.push(format!("linux.{key} is not supported"));
+        }
+    }
+    if value
+        .get("process")
+        .and_then(|p| p.get("consoleSize"))
+        .is_some()
+    {
+        reasons.push("process.consoleSize is not supported".to_string());
+    }
+    if value
+        .get("process")
+        .and_then(|p| p.get("ioPriority"))
+        .is_some()
+    {
+        reasons.push("process.ioPriority is not supported".to_string());
+    }
+    if value
+        .get("process")
+        .and_then(|p| p.get("rlimits"))
+        .is_some()
+    {
+        validate_rlimits(value, reasons);
+    }
+    validate_sysctls(value, reasons);
+    validate_mount_options(value, reasons);
+}
+
+fn validate_rlimits(value: &serde_json::Value, reasons: &mut Vec<String>) {
+    let Some(rlimits) = value
+        .get("process")
+        .and_then(|p| p.get("rlimits"))
+        .and_then(|v| v.as_array())
+    else {
+        return;
+    };
+    for rlimit in rlimits {
+        let soft = rlimit.get("soft").and_then(|v| v.as_u64());
+        let hard = rlimit.get("hard").and_then(|v| v.as_u64());
+        if let (Some(soft), Some(hard)) = (soft, hard) {
+            if soft > hard {
+                let kind = rlimit
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                reasons.push(format!(
+                    "process.rlimits[{kind}] has soft greater than hard"
+                ));
+            }
+        }
+    }
+}
+
+fn validate_sysctls(value: &serde_json::Value, reasons: &mut Vec<String>) {
+    let Some(sysctls) = value
+        .get("linux")
+        .and_then(|l| l.get("sysctl"))
+        .and_then(|v| v.as_object())
+    else {
+        return;
+    };
+    let namespaces = value
+        .get("linux")
+        .and_then(|l| l.get("namespaces"))
+        .and_then(|v| v.as_array());
+    let has_ns = |name: &str| -> bool {
+        namespaces
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|ns| ns.get("type").and_then(|v| v.as_str()) == Some(name))
+            })
+            .unwrap_or(false)
+    };
+    if value
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some()
+        && sysctls.contains_key("kernel.hostname")
+    {
+        reasons.push("linux.sysctl.kernel.hostname conflicts with hostname".to_string());
+    }
+    for key in sysctls.keys() {
+        if key.starts_with("net.") && !has_ns("network") {
+            reasons.push(format!("linux.sysctl.{key} requires a network namespace"));
+        }
+        if matches!(key.as_str(), "kernel.hostname" | "kernel.domainname") && !has_ns("uts") {
+            reasons.push(format!("linux.sysctl.{key} requires a UTS namespace"));
+        }
+    }
+}
+
+fn validate_mount_options(value: &serde_json::Value, reasons: &mut Vec<String>) {
+    let Some(mounts) = value.get("mounts").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for mount in mounts {
+        let dest = mount
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let Some(options) = mount.get("options").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for option in options.iter().filter_map(|v| v.as_str()) {
+            if option == "tmpcopyup" {
+                reasons.push(format!(
+                    "mount option tmpcopyup is not supported for {dest}"
+                ));
+            }
+            if is_recursive_mount_attr(option) {
+                reasons.push(format!(
+                    "recursive mount option {option} is not supported for {dest}"
+                ));
+            }
+        }
+    }
+}
+
+fn is_recursive_mount_attr(option: &str) -> bool {
+    matches!(
+        option,
+        "rro"
+            | "rrw"
+            | "rnoexec"
+            | "rexec"
+            | "rnosuid"
+            | "rsuid"
+            | "rnodev"
+            | "rdev"
+            | "rrelatime"
+            | "rnorelatime"
+            | "rnoatime"
+            | "ratime"
+            | "rnodiratime"
+            | "rdiratime"
+    )
 }
 
 fn sub_features() -> std::io::Result<()> {
@@ -391,6 +626,7 @@ fn create_with_ext(
     console_socket: Option<&std::path::Path>,
     preserve_fds: u32,
     no_pivot: bool,
+    timeout_ms: Option<u64>,
 ) -> std::io::Result<()> {
     let canonical = bundle.canonicalize()?;
     let spec = rsrun_core::spec::Spec::from_bundle(&canonical)?;
@@ -399,5 +635,65 @@ fn create_with_ext(
         preserve_fds,
         no_pivot,
     };
-    runtime::cmd_create_full(id, bundle, pid_file, ext, console_socket, opts)
+    runtime::cmd_create_full_with_timeout(
+        id,
+        bundle,
+        pid_file,
+        ext,
+        console_socket,
+        opts,
+        timeout_ms,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_duration_suffixes() {
+        assert_eq!(parse_duration_ms("250ms").unwrap(), 250);
+        assert_eq!(parse_duration_ms("2s").unwrap(), 2_000);
+        assert_eq!(parse_duration_ms("3m").unwrap(), 180_000);
+        assert_eq!(parse_duration_ms("4").unwrap(), 4_000);
+        assert!(parse_duration_ms("abc").is_err());
+    }
+
+    #[test]
+    fn validation_reports_unsupported_and_conflicting_fields() {
+        let spec = json!({
+            "hostname": "demo",
+            "process": {
+                "consoleSize": {"height": 24, "width": 80},
+                "rlimits": [{"type": "RLIMIT_NOFILE", "soft": 9, "hard": 8}]
+            },
+            "mounts": [{
+                "destination": "/cfg",
+                "type": "tmpfs",
+                "source": "tmpfs",
+                "options": ["tmpcopyup", "rro"]
+            }],
+            "linux": {
+                "mountLabel": "system_u:object_r:container_file_t:s0",
+                "sysctl": {"kernel.hostname": "other", "net.ipv4.ip_forward": "1"},
+                "namespaces": [{"type": "mount"}]
+            }
+        });
+        let mut reasons = Vec::new();
+        collect_validation_reasons(&spec, &mut reasons);
+        assert!(reasons.iter().any(|r| r.contains("linux.mountLabel")));
+        assert!(reasons.iter().any(|r| r.contains("process.consoleSize")));
+        assert!(reasons.iter().any(|r| r.contains("soft greater than hard")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("kernel.hostname conflicts")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("requires a network namespace")));
+        assert!(reasons.iter().any(|r| r.contains("tmpcopyup")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("recursive mount option rro")));
+    }
 }

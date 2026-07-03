@@ -25,6 +25,7 @@ pub use runtime::{
     cmd_create, cmd_create_full, cmd_create_with_ext, cmd_delete, cmd_exec, cmd_exec_agent,
     cmd_exec_full, cmd_kill, cmd_list, cmd_start, cmd_state, AgentExecOpts,
 };
+pub use runtime::{cmd_create_full_with_timeout, cmd_delete_with_timeout, cmd_start_with_timeout};
 
 #[cfg(feature = "update")]
 pub use runtime::cmd_update;

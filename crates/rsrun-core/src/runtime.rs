@@ -60,6 +60,7 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execve, execvpe, mkfifo, pivot_root, sethostname, Pid};
 use std::ffi::CString;
 use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -102,12 +103,26 @@ pub fn cmd_create_full(
     console_socket: Option<&Path>,
     opts: crate::plan::CreateOpts,
 ) -> std::io::Result<()> {
+    cmd_create_full_with_timeout(id, bundle, pid_file, ext, console_socket, opts, None)
+}
+
+pub fn cmd_create_full_with_timeout(
+    id: &str,
+    bundle: &Path,
+    pid_file: Option<&Path>,
+    ext: crate::plan::ExtPlan,
+    console_socket: Option<&Path>,
+    opts: crate::plan::CreateOpts,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    let deadline = Deadline::from_timeout_ms(timeout_ms);
     let bundle = bundle.canonicalize()?;
     let spec = Spec::from_bundle(&bundle)?;
     let mut plan = CompiledPlan::from_spec(&spec)?;
     plan.ext = ext;
     plan.console_socket = console_socket.map(|p| p.to_path_buf());
     plan.no_pivot = opts.no_pivot;
+    deadline.check("create")?;
 
     // Validate (type, path) pairs for namespace joins before doing any
     // state-dir setup. The OCI spec requires the runtime to MUST error
@@ -239,8 +254,9 @@ pub fn cmd_create_full(
     // window is between unshare and pivot_root; since rsrun creates
     // namespaces atomically via clone3, the closest equivalent is
     // right before the clone.
-    run_hooks(&plan.ext.hooks.create_runtime, id)?;
-    run_hooks(&plan.ext.hooks.prestart, id)?;
+    run_hooks(&plan.ext.hooks.create_runtime, id, deadline)?;
+    run_hooks(&plan.ext.hooks.prestart, id, deadline)?;
+    deadline.check("create")?;
 
     // PTY allocation (when `process.terminal: true` and a console
     // socket is available). The slave fd is inherited by the child via
@@ -513,6 +529,63 @@ fn load_hooks(paths: &ContainerPaths) -> crate::plan::Hooks {
     crate::plan::Hooks::from_json(&v)
 }
 
+#[derive(Clone, Copy)]
+struct Deadline {
+    expires_at: Option<Instant>,
+}
+
+impl Deadline {
+    fn from_timeout_ms(timeout_ms: Option<u64>) -> Self {
+        Self {
+            expires_at: timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+        }
+    }
+
+    fn check(self, op: &str) -> std::io::Result<()> {
+        if self
+            .expires_at
+            .map(|expires| Instant::now() >= expires)
+            .unwrap_or(false)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{op} exceeded timeout"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn remaining_ms(self, op: &str) -> std::io::Result<Option<u64>> {
+        let Some(expires) = self.expires_at else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if now >= expires {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{op} exceeded timeout"),
+            ));
+        }
+        Ok(Some(
+            expires
+                .saturating_duration_since(now)
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        ))
+    }
+
+    fn hook_timeout_ms(self, hook_timeout_ms: Option<u64>) -> std::io::Result<Option<u64>> {
+        let remaining = self.remaining_ms("hook")?;
+        Ok(match (hook_timeout_ms, remaining) {
+            (Some(hook), Some(rem)) => Some(hook.min(rem)),
+            (Some(hook), None) => Some(hook),
+            (None, Some(rem)) => Some(rem),
+            (None, None) => None,
+        })
+    }
+}
+
 /// Connect to the engine's AF_UNIX console socket and send the PTY
 /// master fd via SCM_RIGHTS — the conventional `console.sock` protocol.
 /// Payload is the path "/dev/ptmx" (any short non-empty bytes work;
@@ -562,7 +635,7 @@ fn send_pty_master(socket_path: &Path, master_fd: i32) -> std::io::Result<()> {
 /// the hook explicitly fails. The container's `state.json` would be
 /// piped to stdin for compliance — we write the minimal JSON `rsrun`
 /// can construct from `id` alone.
-fn run_hooks(hooks: &[crate::plan::HookCmd], id: &str) -> std::io::Result<()> {
+fn run_hooks(hooks: &[crate::plan::HookCmd], id: &str, deadline: Deadline) -> std::io::Result<()> {
     if hooks.is_empty() {
         return Ok(());
     }
@@ -570,6 +643,7 @@ fn run_hooks(hooks: &[crate::plan::HookCmd], id: &str) -> std::io::Result<()> {
         "{{\"ociVersion\":\"1.0.2\",\"id\":\"{id}\",\"status\":\"creating\",\"pid\":0,\"bundle\":\"\"}}"
     );
     for h in hooks {
+        deadline.check("hook")?;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(std::io::Error::last_os_error());
@@ -596,7 +670,7 @@ fn run_hooks(hooks: &[crate::plan::HookCmd], id: &str) -> std::io::Result<()> {
             }
         }
         // Parent: wait, killing the hook if it exceeds its timeout.
-        wait_hook_with_timeout(pid, h.timeout_ms)?;
+        wait_hook_with_timeout(pid, deadline.hook_timeout_ms(h.timeout_ms)?)?;
     }
     Ok(())
 }
@@ -2204,6 +2278,11 @@ fn update_status(id: &str, status: &str) -> std::io::Result<()> {
 }
 
 pub fn cmd_start(id: &str) -> std::io::Result<()> {
+    cmd_start_with_timeout(id, None)
+}
+
+pub fn cmd_start_with_timeout(id: &str, timeout_ms: Option<u64>) -> std::io::Result<()> {
+    let deadline = Deadline::from_timeout_ms(timeout_ms);
     let paths = ContainerPaths::for_id(id);
     if !paths.root.exists() {
         return Err(std::io::Error::other(format!(
@@ -2211,12 +2290,21 @@ pub fn cmd_start(id: &str) -> std::io::Result<()> {
         )));
     }
     let pid = read_pid(&paths)?;
+    deadline.check("start")?;
 
     // Open the FIFO write-side. The init process is blocked in read on the
-    // other end; this unblocks it.
-    let mut f = std::fs::OpenOptions::new().write(true).open(paths.fifo())?;
+    // other end; this unblocks it. Use O_NONBLOCK so a dead init cannot
+    // wedge `start` forever.
+    let fifo_c = CString::new(paths.fifo().as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::other("fifo path contains NUL"))?;
+    let fd = unsafe { libc::open(fifo_c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     f.write_all(b"S")?;
     drop(f);
+    deadline.check("start")?;
 
     let bundle = read_bundle(&paths)?;
     let comm_hint = read_comm_hint(&paths);
@@ -2226,12 +2314,21 @@ pub fn cmd_start(id: &str) -> std::io::Result<()> {
     // here are logged-and-warning, not fatal.
     let hooks = load_hooks(&paths);
     if !hooks.poststart.is_empty() {
-        let _ = run_hooks(&hooks.poststart, id);
+        let _ = run_hooks(&hooks.poststart, id, deadline);
     }
     Ok(())
 }
 
 pub fn cmd_delete(id: &str, force: bool) -> std::io::Result<()> {
+    cmd_delete_with_timeout(id, force, None)
+}
+
+pub fn cmd_delete_with_timeout(
+    id: &str,
+    force: bool,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    let deadline = Deadline::from_timeout_ms(timeout_ms);
     let paths = ContainerPaths::for_id(id);
     if !paths.root.exists() {
         // delete -f against a missing container should succeed
@@ -2255,36 +2352,89 @@ pub fn cmd_delete(id: &str, force: bool) -> std::io::Result<()> {
             )));
         }
     }
+    deadline.check("delete")?;
 
     if let Ok(pid) = read_pid(&paths) {
         let pid_raw = pid;
         let pid = Pid::from_raw(pid);
         if force {
             let _ = kill(pid, Signal::SIGKILL);
+            kill_cgroup_procs(id, pid_raw, libc::SIGKILL);
         }
-        // Bound the wait: if the init isn't our child (lost across a
-        // parent exit) waitpid returns ECHILD immediately. If it *is*
-        // our child but we didn't kill (force=false on a stopped
-        // container), waitpid is fine. The only hang risk is a live
-        // unkilled orphan, but the !force branch above rejected that.
-        let _ = waitpid(pid, None);
+        wait_pid_bounded(pid_raw, deadline)?;
         for _ in 0..200 {
             if !std::path::Path::new(&format!("/proc/{}", pid_raw)).exists() {
                 break;
             }
+            deadline.check("delete").map_err(|e| {
+                let _ = mark_failed(&paths, &e.to_string());
+                e
+            })?;
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+    deadline.check("delete").map_err(|e| {
+        let _ = mark_failed(&paths, &e.to_string());
+        e
+    })?;
 
     // poststop fires after the container has stopped, before its state
     // dir is destroyed (so the hook can still read state files).
     let hooks = load_hooks(&paths);
     if !hooks.poststop.is_empty() {
-        let _ = run_hooks(&hooks.poststop, id);
+        let _ = run_hooks(&hooks.poststop, id, deadline);
     }
 
     paths.destroy()?;
     Ok(())
+}
+
+fn wait_pid_bounded(pid_raw: i32, deadline: Deadline) -> std::io::Result<()> {
+    if deadline.expires_at.is_none() {
+        let _ = waitpid(Pid::from_raw(pid_raw), None);
+        return Ok(());
+    }
+    loop {
+        let mut status = 0i32;
+        let r = unsafe { libc::waitpid(pid_raw, &mut status, libc::WNOHANG) };
+        if r == pid_raw {
+            return Ok(());
+        }
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
+        }
+        deadline.check("delete")?;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn kill_cgroup_procs(id: &str, init_pid: i32, signal: i32) {
+    let procs = format!("/sys/fs/cgroup/rsrun-{id}/cgroup.procs");
+    if let Ok(contents) = std::fs::read_to_string(procs) {
+        for line in contents.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                if pid != init_pid {
+                    unsafe {
+                        let _ = libc::kill(pid, signal);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mark_failed(paths: &ContainerPaths, reason: &str) -> std::io::Result<()> {
+    let bytes = std::fs::read(paths.state_file())?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    value["status"] = serde_json::Value::String("failed".to_string());
+    value["cleanupError"] = serde_json::Value::String(reason.to_string());
+    std::fs::write(paths.state_file(), serde_json::to_vec(&value)?)
 }
 
 pub fn cmd_state(id: &str) -> std::io::Result<()> {
@@ -2786,6 +2936,8 @@ struct CgroupSample {
     cpu_usage_usec: u64,
     memory_current: u64,
     memory_peak: u64,
+    pids_current: u64,
+    pids_peak: u64,
     oom: u64,
     oom_kill: u64,
 }
@@ -2833,6 +2985,7 @@ struct AgentExecResult {
     stderr: CapturedStream,
     cpu_ms: u64,
     max_rss_bytes: u64,
+    pids_peak: u64,
     oom_killed: bool,
 }
 
@@ -2961,6 +3114,10 @@ fn wait_agent_exec(
         .memory_peak
         .max(stats_after.memory_current)
         .max(stats_before.memory_peak);
+    let pids_peak = stats_after
+        .pids_peak
+        .max(stats_after.pids_current)
+        .max(stats_before.pids_peak);
     let oom_killed =
         stats_after.oom_kill > stats_before.oom_kill || stats_after.oom > stats_before.oom;
 
@@ -2973,6 +3130,7 @@ fn wait_agent_exec(
         stderr,
         cpu_ms,
         max_rss_bytes,
+        pids_peak,
         oom_killed,
     })
 }
@@ -2992,6 +3150,7 @@ fn emit_agent_exec_result(result: &AgentExecResult, json: bool) -> std::io::Resu
             "stderr_truncated": result.stderr.truncated,
             "cpu_ms": result.cpu_ms,
             "max_rss_bytes": result.max_rss_bytes,
+            "pids_peak": result.pids_peak,
             "oom_killed": result.oom_killed,
         });
         println!("{}", serde_json::to_string(&value)?);
@@ -3114,6 +3273,14 @@ fn read_cgroup_sample(dir_fd: i32) -> CgroupSample {
             .parse()
             .unwrap_or(0),
         memory_peak: read_cgroup_file(dir_fd, "memory.peak")
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        pids_current: read_cgroup_file(dir_fd, "pids.current")
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        pids_peak: read_cgroup_file(dir_fd, "pids.peak")
             .trim()
             .parse()
             .unwrap_or(0),

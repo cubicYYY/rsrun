@@ -104,6 +104,25 @@ check() {
   fi
 }
 
+# ── 0. validate-bundle ─────────────────────────────────────────────────
+echo "== 0. validate-bundle =="
+write_config validate ""
+python3 - <<EOF
+import json
+p = "$BUNDLE/config.json"
+c = json.load(open(p))
+c.setdefault("linux", {})["mountLabel"] = "system_u:object_r:container_file_t:s0"
+c["process"]["consoleSize"] = {"height": 24, "width": 80}
+json.dump(c, open(p, "w"))
+EOF
+validate_json=$WORK/validate.json
+if $RUNTIME validate-bundle "$BUNDLE" --json > "$validate_json" 2>/dev/null; then
+  check "validate-bundle rejects unsupported bundle" "false"
+else
+  check "validate-bundle rejects unsupported bundle" \
+    "python3 -c 'import json,sys; j=json.load(open(\"$validate_json\")); sys.exit(0 if j[\"supported\"] is False and any(\"mountLabel\" in r for r in j[\"reasons\"]) else 1)'"
+fi
+
 # ── 1. baseline lifecycle ───────────────────────────────────────────────
 echo "== 1. lifecycle =="
 write_config base ""
@@ -140,6 +159,65 @@ t1=$(date +%s.%N)
 elapsed=$(python3 -c "print(f'{$t1 - $t0:.2f}')")
 # Should be ~1s (timeout) + ~0.05s overhead, definitely under 5s.
 check "delete killed runaway hook (took ${elapsed}s, want <5s)" \
+  "python3 -c 'import sys; sys.exit(0 if $t1 - $t0 < 5 else 1)'"
+
+write_config create_timeout "" '"/bin/sleep", "30"'
+python3 - <<EOF
+import json
+p = "$BUNDLE/config.json"
+c = json.load(open(p))
+c["hooks"] = {"createRuntime": [{
+  "path": "/usr/bin/sleep",
+  "args": ["sleep", "30"]
+}]}
+json.dump(c, open(p, "w"))
+EOF
+t0=$(date +%s.%N)
+if $SUDO $RUNTIME --root $WORK/state.create_timeout create \
+  --timeout 200ms -b "$BUNDLE" ctimeout 2>/dev/null; then
+  check "create timeout rejects runaway hook" "false"
+else
+  t1=$(date +%s.%N)
+  check "create timeout rejects runaway hook" \
+    "python3 -c 'import sys; sys.exit(0 if $t1 - $t0 < 5 else 1)'"
+fi
+
+write_config start_timeout "" '"/bin/sleep", "30"'
+python3 - <<EOF
+import json
+p = "$BUNDLE/config.json"
+c = json.load(open(p))
+c["hooks"] = {"poststart": [{
+  "path": "/usr/bin/sleep",
+  "args": ["sleep", "30"]
+}]}
+json.dump(c, open(p, "w"))
+EOF
+$SUDO $RUNTIME --root $WORK/state.start_timeout create -b "$BUNDLE" cstart
+t0=$(date +%s.%N)
+$SUDO $RUNTIME --root $WORK/state.start_timeout start --timeout 200ms cstart
+t1=$(date +%s.%N)
+check "start timeout bounds runaway poststart hook" \
+  "python3 -c 'import sys; sys.exit(0 if $t1 - $t0 < 5 else 1)'"
+$SUDO $RUNTIME --root $WORK/state.start_timeout delete -f cstart
+
+write_config delete_timeout "" '"/bin/sleep", "30"'
+python3 - <<EOF
+import json
+p = "$BUNDLE/config.json"
+c = json.load(open(p))
+c["hooks"] = {"poststop": [{
+  "path": "/usr/bin/sleep",
+  "args": ["sleep", "30"]
+}]}
+json.dump(c, open(p, "w"))
+EOF
+$SUDO $RUNTIME --root $WORK/state.delete_timeout create -b "$BUNDLE" cdelete
+$SUDO $RUNTIME --root $WORK/state.delete_timeout start cdelete
+t0=$(date +%s.%N)
+$SUDO $RUNTIME --root $WORK/state.delete_timeout delete --timeout 200ms -f cdelete
+t1=$(date +%s.%N)
+check "delete timeout bounds runaway poststop hook" \
   "python3 -c 'import sys; sys.exit(0 if $t1 - $t0 < 5 else 1)'"
 
 # ── 3. process.scheduler ────────────────────────────────────────────────
