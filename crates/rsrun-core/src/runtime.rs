@@ -1041,7 +1041,10 @@ unsafe fn child_run(
         if chdir("/").is_err() {
             child_die(err_fd, 104, b"chdir / failed");
         }
-        // Detach the old root and remove the directory.
+        // Detach the old root and remove the directory. MNT_DETACH is
+        // the bounded unmount behavior we want here: the mount is
+        // disconnected immediately, while the kernel releases busy
+        // references later instead of making the runtime wait on them.
         if umount2("/.rsrun_old", MntFlags::MNT_DETACH).is_err() {
             child_die(err_fd, 105, b"umount old_root failed");
         }
@@ -3536,4 +3539,34 @@ pub fn cmd_list() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn mark_failed_persists_status_and_reason() {
+        let root =
+            std::env::temp_dir().join(format!("rsrun-mark-failed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = ContainerPaths { root: root.clone() };
+        std::fs::write(
+            paths.state_file(),
+            br#"{"ociVersion":"1.0.2","id":"c","status":"running","pid":123,"bundle":"/b","annotations":{}}"#,
+        )
+        .unwrap();
+
+        mark_failed(&paths, "delete exceeded timeout").unwrap();
+
+        let bytes = std::fs::read(paths.state_file()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(
+            value.get("cleanupError").and_then(|v| v.as_str()),
+            Some("delete exceeded timeout")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
