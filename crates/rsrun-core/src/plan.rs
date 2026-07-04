@@ -137,6 +137,8 @@ pub struct ExtPlan {
     /// Absolute cgroup-v2 directory the container should join (e.g.
     /// `/sys/fs/cgroup/rsrun-<id>`). Created by ext, joined by core
     /// after clone3 by writing the child PID into `cgroup.procs`.
+    /// If `RSRUN_CLONE_INTO_CGROUP=1` is set, core first tries
+    /// `clone3(CLONE_INTO_CGROUP)` and falls back to the write.
     pub cgroup_v2_path: Option<PathBuf>,
     /// `(filename, content)` writes into the cgroup directory, e.g.
     /// `("memory.max", b"134217728\n")`. Applied by core in the parent

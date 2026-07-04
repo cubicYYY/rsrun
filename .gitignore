@@ -11,3 +11,5 @@ Cargo.lock.bak
 tests/
 
 SPEC.md
+AGENTS.md
+CLAUDE.md

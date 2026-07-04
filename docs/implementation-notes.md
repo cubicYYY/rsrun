@@ -124,6 +124,20 @@ rsrun yet, or boot with `systemd.unified_cgroup_hierarchy=1`.
 `systemd-run` (see the dedicated section below). Without the flag we
 write cgroupfs directly. Both are supported.
 
+**Process placement:** by default, rsrun writes the init pid to
+`cgroup.procs` after `clone3`. `clone3(CLONE_INTO_CGROUP)` is
+available only when `RSRUN_CLONE_INTO_CGROUP=1` is set. The opt-in path
+opens the target cgroup directory, passes the fd in `CloneArgs.cgroup`,
+and skips the post-clone migration when the kernel accepts it. If the
+kernel rejects the flag, rsrun retries without it and falls back to
+`cgroup.procs`.
+
+**Why opt-in:** the flag can reduce cgroup accounting movement, but the
+local lifecycle benchmark showed it slower for `create + start +
+delete` with cgroup resources enabled. The default therefore keeps the
+measured-faster path; operators who care more about avoiding migration
+accounting can enable the flag explicitly.
+
 ---
 
 ## Device cgroup BPF (hand-rolled emitter)
@@ -201,6 +215,50 @@ rules for the six OCI default char devices and for everything in
 the kernel verifier log on EINVAL and surface it in the user-facing
 error so the next person who hits a wire-format bug doesn't lose the
 same hour we did.
+
+---
+
+## Overlay-backed filesystem state
+
+**Goal:** agent rollout needs cheap reset, diff, branch, and checkpoint
+operations without making the normal OCI lifecycle carry extra cost.
+
+**Rootfs backend:** bundles may opt into `rsrun.rootfs.backend =
+"overlayfs"`. `create` mounts an overlay with a prepared lower rootfs
+and state-owned `upper`, `work`, and `merged` directories. The runtime
+persists those paths in `overlay.json` and validates that writable paths
+stay under the rsrun state root before reset or cleanup.
+
+**Diff/export:** `changed-files`, `diff`, and `export-diff` scan only
+the overlay upperdir. Whiteouts are recognized as either char device
+`0:0` or `trusted.overlay.whiteout`; opaque directories use
+`trusted.overlay.opaque`. Tar export maps those to `.wh.<name>` and
+`.wh..wh..opq`.
+
+**Clone-style snapshots:** `snapshot`, `restore`, and `fork` clone the
+recorded upperdir. Regular files try `FICLONE` first and fall back to
+copy. Special files, symlinks, ownership, permissions, and xattrs are
+preserved best-effort. Size and entry limits prevent accidentally
+cloning unbounded state.
+
+**Layer-style checkpoints:** `checkpoint` freezes the current upperdir
+as a read-only lower layer. `fork-checkpoint` creates a stopped state
+with an empty writable upperdir over the checkpoint chain:
+
+```text
+lowerdir = checkpoint_N : checkpoint_N-1 : base
+upperdir = new branch upper
+```
+
+This avoids per-branch copies when many rollout branches start from the
+same checkpoint. Long chains still need policy above rsrun: compact
+when lookup cost or mount option length becomes a problem.
+
+**Markers and effects:** `mark` stores a named overlay-diff baseline;
+`effects --since <marker> --json` rescans the upperdir and reports the
+paths whose metadata changed since that baseline. A marker includes the
+overlay reset generation, so effects are rejected after `reset` instead
+of returning misleading results.
 
 ---
 

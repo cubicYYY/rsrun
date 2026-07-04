@@ -59,8 +59,9 @@ rollout use. They intentionally sit ahead of broad crun parity.
 - ✅ `mark` and `effects --since <marker> --json` compare current
   overlayfs effects against a named filesystem marker for rollout
   control and debugging.
-- `clone3(CLONE_INTO_CGROUP)` once cgroup placement shows up in the
-  agent hot path, to avoid a post-fork cgroup join.
+- ✅ Opt-in `clone3(CLONE_INTO_CGROUP)` for cgroup-v2 placement via
+  `RSRUN_CLONE_INTO_CGROUP=1`, with the faster default path retaining
+  the previous `cgroup.procs` write.
 
 ### Storage scope
 
@@ -361,8 +362,6 @@ These are speculative. None are blocked on a missing OCI feature.
 
 - **`mimalloc` as global allocator.** Slight startup improvement.
 - **`pidfd`-based wait** in `delete` (avoid `/proc/<pid>` polling).
-- **`clone3` with `CLONE_INTO_CGROUP`** to skip the post-fork cgroup
-  join write — relevant once cgroup limits are commonly used.
 - **Plan cache.** Compile `config.json` once, mmap at create — for
   deployments that launch many copies of the same bundle.
 

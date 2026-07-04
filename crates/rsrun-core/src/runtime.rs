@@ -67,6 +67,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+const CLONE_INTO_CGROUP: u64 = 0x0002_0000_0000;
+
 pub fn cmd_create(id: &str, bundle: &Path, pid_file: Option<&Path>) -> std::io::Result<()> {
     cmd_create_with_ext(id, bundle, pid_file, crate::plan::ExtPlan::default())
 }
@@ -355,23 +357,45 @@ pub fn cmd_create_full_with_timeout(
         }
     }
 
-    // Build clone3 args.
-    let mut args = CloneArgs {
-        flags: plan.clone_flags.bits() as u64,
-        exit_signal: libc::SIGCHLD as u64,
-        ..Default::default()
-    };
     let pidfd: i32 = -1;
-    args.pidfd = (&pidfd as *const i32) as u64;
-    args.flags |= libc::CLONE_PIDFD as u64;
+    let cgroup_fd = if clone_into_cgroup_enabled() {
+        plan.ext
+            .cgroup_v2_path
+            .as_deref()
+            .and_then(|path| open_cgroup_dir_fd(path).ok())
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
 
     // SAFETY: see child_run preconditions.
-    let pid = unsafe { clone3(&args) };
+    let mut clone_used_cgroup = cgroup_fd >= 0;
+    let mut args = build_clone_args(plan.clone_flags.bits() as u64, &pidfd, cgroup_fd);
+    let mut pid = unsafe { clone3(&args) };
+    if pid < 0 && clone_used_cgroup {
+        let err = std::io::Error::last_os_error();
+        if should_retry_without_clone_into_cgroup(&err) {
+            clone_used_cgroup = false;
+            args = build_clone_args(plan.clone_flags.bits() as u64, &pidfd, -1);
+            pid = unsafe { clone3(&args) };
+        } else {
+            if cgroup_fd >= 0 {
+                unsafe { libc::close(cgroup_fd) };
+            }
+            return Err(err);
+        }
+    }
     if pid < 0 {
+        if cgroup_fd >= 0 {
+            unsafe { libc::close(cgroup_fd) };
+        }
         return Err(std::io::Error::last_os_error());
     }
 
     if pid == 0 {
+        if cgroup_fd >= 0 {
+            unsafe { libc::close(cgroup_fd) };
+        }
         // Child path. Close the parent's write-side of the userns pipe.
         if userns_write_fd >= 0 {
             unsafe { libc::close(userns_write_fd) };
@@ -397,6 +421,10 @@ pub fn cmd_create_full_with_timeout(
             );
         }
         unsafe { libc::_exit(127) }
+    }
+
+    if cgroup_fd >= 0 {
+        unsafe { libc::close(cgroup_fd) };
     }
 
     // Parent: close idmap helper userns fds (the child has its own
@@ -489,10 +517,15 @@ pub fn cmd_create_full_with_timeout(
         pid
     };
 
-    // Move the (real) init into its cgroup-v2 group now that we know its PID.
-    if let Some(cgroup_dir) = plan.ext.cgroup_v2_path.as_deref() {
-        let procs = cgroup_dir.join("cgroup.procs");
-        let _ = std::fs::write(&procs, init_pid.to_string());
+    // Fallback for kernels or cgroup configurations that rejected
+    // CLONE_INTO_CGROUP. When clone-into-cgroup succeeded, the direct
+    // child and any PID-join grandchild already execute in the target
+    // cgroup, so writing cgroup.procs would be redundant migration.
+    if !clone_used_cgroup {
+        if let Some(cgroup_dir) = plan.ext.cgroup_v2_path.as_deref() {
+            let procs = cgroup_dir.join("cgroup.procs");
+            let _ = std::fs::write(&procs, init_pid.to_string());
+        }
     }
 
     // process.oomScoreAdj — written to /proc/<init>/oom_score_adj
@@ -733,6 +766,49 @@ fn reject_overlay_lowerdir_chars(path: &Path) -> std::io::Result<()> {
         )));
     }
     Ok(())
+}
+
+fn open_cgroup_dir_fd(path: &Path) -> std::io::Result<i32> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("cgroup path contains NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn build_clone_args(namespace_flags: u64, pidfd: &i32, cgroup_fd: i32) -> CloneArgs {
+    let mut args = CloneArgs {
+        flags: namespace_flags | libc::CLONE_PIDFD as u64,
+        pidfd: (pidfd as *const i32) as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..Default::default()
+    };
+    if cgroup_fd >= 0 {
+        args.flags |= CLONE_INTO_CGROUP;
+        args.cgroup = cgroup_fd as u64;
+    }
+    args
+}
+
+fn should_retry_without_clone_into_cgroup(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::EACCES | libc::EBUSY | libc::ENODEV)
+    )
+}
+
+fn clone_into_cgroup_enabled() -> bool {
+    matches!(
+        std::env::var("RSRUN_CLONE_INTO_CGROUP").ok().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 fn mount_overlay(overlay: &OverlayRootfs) -> std::io::Result<()> {
@@ -5350,6 +5426,67 @@ mod runtime_tests {
             Some("delete exceeded timeout")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clone_args_enable_clone_into_cgroup_when_fd_is_available() {
+        let pidfd = -1;
+        let args = build_clone_args(libc::CLONE_NEWNS as u64, &pidfd, 42);
+
+        assert_ne!(args.flags & CLONE_INTO_CGROUP, 0);
+        assert_ne!(args.flags & libc::CLONE_PIDFD as u64, 0);
+        assert_eq!(
+            args.flags & libc::CLONE_NEWNS as u64,
+            libc::CLONE_NEWNS as u64
+        );
+        assert_eq!(args.cgroup, 42);
+        assert_eq!(args.exit_signal, libc::SIGCHLD as u64);
+        assert_eq!(args.pidfd, (&pidfd as *const i32) as u64);
+    }
+
+    #[test]
+    fn clone_args_skip_clone_into_cgroup_without_fd() {
+        let pidfd = -1;
+        let args = build_clone_args(0, &pidfd, -1);
+
+        assert_eq!(args.flags & CLONE_INTO_CGROUP, 0);
+        assert_eq!(args.cgroup, 0);
+        assert_ne!(args.flags & libc::CLONE_PIDFD as u64, 0);
+    }
+
+    #[test]
+    fn clone_into_cgroup_retry_policy_is_narrow() {
+        for errno in [
+            libc::EINVAL,
+            libc::EOPNOTSUPP,
+            libc::EACCES,
+            libc::EBUSY,
+            libc::ENODEV,
+        ] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert!(should_retry_without_clone_into_cgroup(&err));
+        }
+
+        let err = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        assert!(!should_retry_without_clone_into_cgroup(&err));
+    }
+
+    #[test]
+    fn clone_into_cgroup_is_opt_in() {
+        std::env::remove_var("RSRUN_CLONE_INTO_CGROUP");
+        assert!(!clone_into_cgroup_enabled());
+
+        std::env::set_var("RSRUN_CLONE_INTO_CGROUP", "1");
+        assert!(clone_into_cgroup_enabled());
+        std::env::set_var("RSRUN_CLONE_INTO_CGROUP", "true");
+        assert!(clone_into_cgroup_enabled());
+        std::env::set_var("RSRUN_CLONE_INTO_CGROUP", "yes");
+        assert!(clone_into_cgroup_enabled());
+        std::env::set_var("RSRUN_CLONE_INTO_CGROUP", "on");
+        assert!(clone_into_cgroup_enabled());
+        std::env::set_var("RSRUN_CLONE_INTO_CGROUP", "0");
+        assert!(!clone_into_cgroup_enabled());
+        std::env::remove_var("RSRUN_CLONE_INTO_CGROUP");
     }
 
     #[test]

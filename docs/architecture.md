@@ -61,6 +61,52 @@ crates/rsrun-ext/src/
 Linux-only (no cfg gates, no stubs). For dev on non-Linux hosts, run
 cargo inside a Lima/Vagrant VM.
 
+## Filesystem state primitives
+
+Overlay-backed rootfs mode is opt-in through the bundle extension:
+
+```json
+{
+  "rsrun": {
+    "rootfs": {
+      "backend": "overlayfs"
+    }
+  }
+}
+```
+
+In that mode, rsrun records the prepared base rootfs as one or more
+read-only lowerdirs and owns the per-container writable upper/work/merged
+directories under the state root:
+
+```text
+<state>/<id>/overlay/upper
+<state>/<id>/overlay/work
+<state>/<id>/overlay/merged
+<state>/<id>/overlay.json
+```
+
+`reset`, `changed-files`, `diff`, and `export-diff` operate only on the
+recorded overlay upperdir. Deleted files are represented with overlay
+whiteouts and exported as portable tar whiteout entries.
+
+Two filesystem-state families are available:
+
+- `snapshot`, `restore`, and `fork` clone the current upperdir with
+  reflink when available and copy fallback otherwise.
+- `checkpoint` freezes the current upperdir as a read-only lower layer;
+  `fork-checkpoint` creates a new stopped state with an empty writable
+  upperdir over the checkpoint lowerdir chain.
+
+Checkpoint metadata records the effective ordered lowerdir chain and a
+structured layer entry (`backend`, `format`, `store`, `path`) so a
+different read-only layer store can be wired in without changing the
+agent-facing commands. `mark` persists a named overlay-diff baseline;
+`effects --since <marker> --json` compares the current diff against
+that baseline and emits changed paths, sensitive touches, and
+approximate written bytes. Markers are invalidated across reset
+generations.
+
 ## Process model
 
 Default 2-process path (one fork via `clone3`):
@@ -91,6 +137,7 @@ parent                                                child
   │                                                   └─ execvpe(argv[0], argv, envp)
   │
   │ [rootless: write uid_map / gid_map / setgroups; signal sync pipe]
+  ├─ write init pid to cgroup.procs unless CLONE_INTO_CGROUP was enabled
   ├─ write /run/rsrun/<id>/init.pid + state.json
   └─ exit 0
 ```
@@ -103,6 +150,12 @@ hot path.
 `start` opens the FIFO write-side and writes one byte; the child wakes
 out of `poll` and proceeds to exec. `delete` sends `SIGKILL` and
 `waitpid`s.
+
+Cgroup placement defaults to the explicit `cgroup.procs` write because
+it is faster on the current benchmark host. Setting
+`RSRUN_CLONE_INTO_CGROUP=1` makes `create` first try
+`clone3(CLONE_INTO_CGROUP)` with the target cgroup fd; if the kernel
+rejects it, rsrun falls back to the `cgroup.procs` write.
 
 ### 3-process path (only on PID-ns join by path)
 

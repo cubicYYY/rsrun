@@ -5,6 +5,10 @@ hooks, LSMs, device-cgroup BPF, pause/update/stats, sysctl,
 systemd-cgroup). Hot path is unchanged because every optional feature
 is opt-in via its spec field.
 
+`CLONE_INTO_CGROUP` is also opt-in (`RSRUN_CLONE_INTO_CGROUP=1`). On
+the benchmark host it reduced no lifecycle latency and was slower than
+the default `cgroup.procs` placement path.
+
 **Headline:** rsrun is faster than `crun` on cold cache, neck-and-neck
 on warm cache, ~2.4× faster than `youki`, ~7× faster than `runc`. Max
 RSS ~2.2 MB, ~35 % less than crun.
@@ -55,6 +59,26 @@ containers via `create + start + delete`, wall-clock time of the loop:
 
 rsrun and crun are usually within ±3 % on individual trials; rsrun's
 median lead is small but consistent across runs.
+
+## Cgroup placement
+
+This benchmark isolates cgroup-v2 resource placement for
+`create + start + delete` with `linux.resources` set. The baseline is
+the default rsrun path: create the cgroup, write resource knobs, then
+write the init pid to `cgroup.procs`. The opt-in variant sets
+`RSRUN_CLONE_INTO_CGROUP=1` and passes the cgroup fd to `clone3`.
+
+`strace` confirmed the opt-in path used
+`clone3(... CLONE_INTO_CGROUP, cgroup=<fd>)` on this host.
+
+| Path | mean ± σ | median | Notes |
+| ---- | -------: | -----: | ----- |
+| default `cgroup.procs` | 1.4 ms ± 1.1 | 1.179 ms | faster default |
+| opt-in `CLONE_INTO_CGROUP` | 3.4 ms ± 0.8 | 3.144 ms | accounting-stability option |
+
+The operation is below `hyperfine`'s ideal timing range, so treat the
+exact numbers cautiously. The direction was stable across command
+orderings, which is why the flag remains off by default.
 
 ## Memory footprint
 

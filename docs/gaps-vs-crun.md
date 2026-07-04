@@ -67,6 +67,14 @@ Most of this tier has now landed. The remaining gap is cgroup v1.
   deadline. Hooks that omit `timeout` can still block, so runtime-level
   operation timeouts remain an agent-runtime roadmap item.
 
+### Filesystem-state snapshot / fork primitives
+- **crun**: `checkpoint` / `restore` are CRIU-backed process
+  checkpoint commands.
+- **rsrun**: has filesystem-only state primitives for overlay-backed
+  stopped states: `snapshot`, `restore`, `fork`, `checkpoint`, and
+  `fork-checkpoint`. These are intended for branchable agent state, not
+  live process checkpointing.
+
 ### `linux.sysctl` conflict validation
 - **crun**: `src/libcrun/linux.c:3666`
 - **What**: rejects `kernel.hostname` if `hostname` field also set;
@@ -154,13 +162,14 @@ Most of this tier has now landed. The remaining gap is cgroup v1.
 |---|---|---|
 | `ps` | `src/ps.c` | list processes inside a container |
 | `mounts` | `src/mounts.c` | dump the container's mount tree (debug) |
-| `checkpoint`, `restore` | `src/checkpoint.c`, `src/restore.c` | CRIU integration |
+| CRIU `checkpoint`, CRIU `restore` | `src/checkpoint.c`, `src/restore.c` | live process checkpoint/restore |
 | `spec` | `src/spec.c` | generate a default `config.json` |
 
 `ps` and `mounts` are crun-specific debugging tools — not OCI verbs.
-`checkpoint`/`restore` are big features (CRIU dependency, ~1500 LOC
-in crun's wrapper alone). `spec` is small and worth implementing for
-ergonomics but rarely hit by engines.
+CRIU checkpoint/restore is a big feature (CRIU dependency, ~1500 LOC in
+crun's wrapper alone). rsrun's similarly named filesystem-state
+commands do not restore live processes. `spec` is small and worth
+implementing for ergonomics but rarely hit by engines.
 
 ## Build / packaging
 

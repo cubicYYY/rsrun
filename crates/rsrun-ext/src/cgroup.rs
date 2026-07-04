@@ -2,8 +2,9 @@
 //!
 //! Reads `linux.resources` from the OCI spec and produces the file
 //! writes needed under `/sys/fs/cgroup/<id>`. Core creates the
-//! directory before clone3, applies the writes, then writes the child
-//! PID into `cgroup.procs` after fork.
+//! directory before clone3, applies the writes, then places the child
+//! with `cgroup.procs` by default or `CLONE_INTO_CGROUP` when explicitly
+//! enabled.
 //!
 //! v2-only. v1 is end-of-life on systemd-cgroup hosts and not in scope.
 

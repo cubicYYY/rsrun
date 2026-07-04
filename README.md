@@ -50,6 +50,9 @@ syscall sequence.
   `linux.namespaces[].path`, idmapped mounts (kernel 5.12+).
 - Engine flags `--systemd-cgroup` (via `systemd-run`),
   `--preserve-fds`, `--no-pivot`.
+- Overlay-backed agent state primitives: `reset`, `changed-files`,
+  `diff`, `export-diff`, `snapshot`, `restore`, `fork`, `checkpoint`,
+  `fork-checkpoint`, `mark`, and `effects`.
 - Passes the [opencontainers/runtime-tools] tests in the
   (`runc` ∩ `crun` ∩ `youki`) intersection.
 - Works under Docker as `--runtime=rsrun`.
@@ -58,6 +61,10 @@ What's not yet implemented: cgroup v1, CRIU checkpoint/restore,
 in-runtime network setup (CNI / bridge / veth — engine territory).
 See [docs/roadmap.md](docs/roadmap.md) and
 [docs/gaps-vs-crun.md](docs/gaps-vs-crun.md) for the full audit.
+
+`CLONE_INTO_CGROUP` is available only as an explicit opt-in:
+`RSRUN_CLONE_INTO_CGROUP=1`. The default remains the faster
+`cgroup.procs` placement path measured in the lifecycle benchmark.
 
 ## Build
 
@@ -107,6 +114,16 @@ rsrun delete -f myid
 ```
 
 State lives at `/run/rsrun/<id>/`. Override with `--root <dir>`.
+
+Overlay-backed state commands are intended for agent and rollout
+workflows, not Docker's CRIU checkpoint API:
+
+```sh
+rsrun checkpoint myid cp1
+rsrun fork-checkpoint cp1 branch1 --json
+rsrun mark branch1 step_10
+rsrun effects branch1 --since step_10 --json
+```
 
 As a Docker runtime:
 

@@ -103,7 +103,9 @@ roadmap, lower priority).
 ## Known limitations
 
 - **`docker checkpoint` / `docker restore`** unsupported (no CRIU
-  integration).
+  integration). rsrun's `snapshot`, `restore`, `checkpoint`, and
+  `fork-checkpoint` commands are filesystem-state primitives for
+  stopped overlay-backed states; Docker does not call them.
 - **OCI hook timeouts** — honored when `hooks[i].timeout` is set in
   `config.json`. CDI plugins that don't set a timeout still hang
   indefinitely; engines should configure a default per their own
