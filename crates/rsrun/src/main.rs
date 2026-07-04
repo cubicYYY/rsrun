@@ -83,6 +83,70 @@ enum Cmd {
         timeout: Option<String>,
         id: String,
     },
+    /// Reset an overlayfs-backed stopped container rootfs.
+    Reset {
+        #[arg(long)]
+        json: bool,
+        id: String,
+    },
+    /// List changed files for an overlayfs-backed container.
+    ChangedFiles {
+        #[arg(long)]
+        json: bool,
+        id: String,
+    },
+    /// Print filesystem diff metadata for an overlayfs-backed container.
+    Diff {
+        #[arg(long)]
+        json: bool,
+        id: String,
+    },
+    /// Export an overlayfs diff.
+    ExportDiff {
+        #[arg(long, default_value = "tar")]
+        format: String,
+        id: String,
+    },
+    /// Save a named filesystem marker for later effects comparison.
+    Mark { id: String, name: String },
+    /// Show filesystem effects since a named marker.
+    Effects {
+        #[arg(long)]
+        since: String,
+        #[arg(long)]
+        json: bool,
+        id: String,
+    },
+    /// Snapshot the filesystem state of an overlayfs-backed stopped container.
+    Snapshot { id: String, snapshot_id: String },
+    /// Save the current writable layer as an immutable checkpoint layer.
+    Checkpoint {
+        #[arg(long)]
+        json: bool,
+        id: String,
+        checkpoint_id: String,
+    },
+    /// Restore a filesystem snapshot as a new stopped overlayfs-backed state.
+    Restore {
+        #[arg(long)]
+        json: bool,
+        snapshot_id: String,
+        new_id: String,
+    },
+    /// Fork a checkpoint into a new stopped state with an empty writable layer.
+    ForkCheckpoint {
+        #[arg(long)]
+        json: bool,
+        checkpoint_id: String,
+        new_id: String,
+    },
+    /// Fork a stopped overlayfs-backed container filesystem into a new state.
+    Fork {
+        #[arg(long)]
+        json: bool,
+        id: String,
+        new_id: String,
+    },
     /// Print the OCI state document for the container.
     State { id: String },
     /// Send a signal to the container init. Defaults to TERM (Docker compat).
@@ -237,6 +301,29 @@ fn main() -> ExitCode {
             .and_then(|timeout_ms| runtime::cmd_start_with_timeout(&id, timeout_ms)),
         Cmd::Delete { force, timeout, id } => parse_optional_duration_ms(timeout.as_deref())
             .and_then(|timeout_ms| runtime::cmd_delete_with_timeout(&id, force, timeout_ms)),
+        Cmd::Reset { json, id } => runtime::cmd_reset(&id, json),
+        Cmd::ChangedFiles { json, id } => runtime::cmd_changed_files(&id, json),
+        Cmd::Diff { json, id } => runtime::cmd_diff(&id, json),
+        Cmd::ExportDiff { format, id } => runtime::cmd_export_diff(&id, &format),
+        Cmd::Mark { id, name } => runtime::cmd_mark(&id, &name),
+        Cmd::Effects { since, json, id } => runtime::cmd_effects(&id, &since, json),
+        Cmd::Snapshot { id, snapshot_id } => runtime::cmd_snapshot(&id, &snapshot_id),
+        Cmd::Checkpoint {
+            json,
+            id,
+            checkpoint_id,
+        } => runtime::cmd_checkpoint(&id, &checkpoint_id, json),
+        Cmd::Restore {
+            json,
+            snapshot_id,
+            new_id,
+        } => runtime::cmd_restore(&snapshot_id, &new_id, json),
+        Cmd::ForkCheckpoint {
+            json,
+            checkpoint_id,
+            new_id,
+        } => runtime::cmd_fork_checkpoint(&checkpoint_id, &new_id, json),
+        Cmd::Fork { json, id, new_id } => runtime::cmd_fork(&id, &new_id, json),
         Cmd::State { id } => runtime::cmd_state(&id),
         Cmd::Kill { id, signal } => runtime::cmd_kill(&id, &signal),
         Cmd::Exec {

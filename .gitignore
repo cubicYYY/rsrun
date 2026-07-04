@@ -9,3 +9,5 @@ Cargo.lock.bak
 
 .env
 tests/
+
+SPEC.md

@@ -21,9 +21,12 @@ pub mod state;
 
 mod runtime;
 
+pub use runtime::cmd_fork;
 pub use runtime::{
-    cmd_create, cmd_create_full, cmd_create_with_ext, cmd_delete, cmd_exec, cmd_exec_agent,
-    cmd_exec_full, cmd_kill, cmd_list, cmd_start, cmd_state, AgentExecOpts,
+    cmd_changed_files, cmd_checkpoint, cmd_create, cmd_create_full, cmd_create_with_ext,
+    cmd_delete, cmd_diff, cmd_effects, cmd_exec, cmd_exec_agent, cmd_exec_full, cmd_export_diff,
+    cmd_fork_checkpoint, cmd_kill, cmd_list, cmd_mark, cmd_reset, cmd_restore, cmd_snapshot,
+    cmd_start, cmd_state, AgentExecOpts,
 };
 pub use runtime::{cmd_create_full_with_timeout, cmd_delete_with_timeout, cmd_start_with_timeout};
 

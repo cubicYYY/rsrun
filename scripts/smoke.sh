@@ -271,7 +271,104 @@ $SUDO $RUNTIME --root $WORK/state.recov delete -f c4
 check "orphan init killed"  "[[ ! -d /proc/$PID ]]"
 check "state dir removed"   "[[ ! -d $WORK/state.recov/c4 ]]"
 
-# ── 5. cleanup ─────────────────────────────────────────────────────────
+# ── 5. overlayfs quick reset ───────────────────────────────────────────
+echo "== 5. overlayfs quick reset =="
+echo lower > "$BUNDLE/rootfs/existing"
+echo remove > "$BUNDLE/rootfs/remove_me"
+chmod 666 "$BUNDLE/rootfs/existing" "$BUNDLE/rootfs/remove_me"
+write_config reset "" '"/bin/sh", "-c", "echo changed >/existing; rm /remove_me; echo added >/added; echo secret >/root_token"'
+python3 - <<EOF
+import json
+p = "$BUNDLE/config.json"
+c = json.load(open(p))
+c["rsrun"] = {"rootfs": {"backend": "overlayfs"}}
+json.dump(c, open(p, "w"))
+EOF
+$SUDO $RUNTIME --root $WORK/state.reset create -b "$BUNDLE" c5
+$SUDO $RUNTIME --root $WORK/state.reset start c5
+for _ in $(seq 1 100); do
+  status=$($SUDO $RUNTIME --root $WORK/state.reset state c5)
+  if echo "$status" | grep -q '"status":"stopped"'; then
+    break
+  fi
+  sleep 0.05
+done
+check "container wrote marker through overlay" \
+  "$SUDO test -f $WORK/state.reset/c5/overlay/merged/added"
+check "lower rootfs stayed clean" \
+  "grep -q '^lower$' $BUNDLE/rootfs/existing && test -e $BUNDLE/rootfs/remove_me && test ! -e $BUNDLE/rootfs/added"
+changed_json=$WORK/changed-files.json
+$SUDO $RUNTIME --root $WORK/state.reset changed-files --json c5 > "$changed_json"
+check "changed-files reports add/modify/delete" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$changed_json\")); m={f[\"path\"]: f[\"kind\"] for f in j[\"files\"]}; sys.exit(0 if m.get(\"added\") == \"added\" and m.get(\"existing\") == \"modified\" and m.get(\"remove_me\") == \"deleted\" else 1)'"
+diff_json=$WORK/diff.json
+$SUDO $RUNTIME --root $WORK/state.reset diff --json c5 > "$diff_json"
+check "diff reports size delta and sensitive paths" \
+  "python3 -c 'import json,sys; fs=json.load(open(\"$diff_json\"))[\"files\"]; by={f[\"path\"]: f for f in fs}; sys.exit(0 if by[\"existing\"][\"size_delta\"] != 0 and by[\"root_token\"][\"sensitive\"] is True else 1)'"
+$SUDO $RUNTIME --root $WORK/state.reset mark c5 step_0
+effects_empty_json=$WORK/effects-empty.json
+$SUDO $RUNTIME --root $WORK/state.reset effects --since step_0 --json c5 > "$effects_empty_json"
+check "effects is empty immediately after marker" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$effects_empty_json\")); sys.exit(0 if j[\"persistent_fs_change\"] is False and j[\"changed_files\"] == [] else 1)'"
+echo after-marker | $SUDO tee "$WORK/state.reset/c5/overlay/merged/after_marker" >/dev/null
+echo changed-again | $SUDO tee "$WORK/state.reset/c5/overlay/merged/existing" >/dev/null
+effects_json=$WORK/effects.json
+$SUDO $RUNTIME --root $WORK/state.reset effects --since step_0 --json c5 > "$effects_json"
+check "effects reports filesystem changes since marker" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$effects_json\")); changed=set(j[\"changed_files\"]); sys.exit(0 if j[\"persistent_fs_change\"] is True and {\"after_marker\", \"existing\"} <= changed and j[\"bytes_written\"] > 0 else 1)'"
+diff_tar=$WORK/diff.tar
+$SUDO $RUNTIME --root $WORK/state.reset export-diff --format tar c5 > "$diff_tar"
+tar -tf "$diff_tar" > "$WORK/diff.tar.list"
+check "export-diff tar includes changes and whiteout" \
+  "grep -q '^added$' $WORK/diff.tar.list && grep -q '^existing$' $WORK/diff.tar.list && grep -q '^.wh.remove_me$' $WORK/diff.tar.list"
+$SUDO $RUNTIME --root $WORK/state.reset snapshot c5 snap1
+restore_json=$WORK/restore.json
+$SUDO $RUNTIME --root $WORK/state.reset restore --json snap1 c6 > "$restore_json"
+check "restore materializes snapshot as stopped overlay state" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$restore_json\")); sys.exit(0 if j[\"restored\"] is True and j[\"backend\"] == \"overlayfs\" else 1)' && $SUDO grep -q '^changed-again$' $WORK/state.reset/c6/overlay/merged/existing && $SUDO test ! -e $WORK/state.reset/c6/overlay/merged/remove_me"
+fork_json=$WORK/fork.json
+$SUDO $RUNTIME --root $WORK/state.reset fork --json c5 c7 > "$fork_json"
+check "fork clones current upperdir into independent stopped state" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$fork_json\")); sys.exit(0 if j[\"forked\"] is True and j[\"backend\"] == \"overlayfs\" else 1)' && $SUDO grep -q '^added$' $WORK/state.reset/c7/overlay/merged/added"
+echo fork-only | $SUDO tee "$WORK/state.reset/c7/overlay/merged/fork_only" >/dev/null
+check "fork does not share writable state with source" \
+  "$SUDO test -e $WORK/state.reset/c7/overlay/merged/fork_only && $SUDO test ! -e $WORK/state.reset/c5/overlay/merged/fork_only"
+checkpoint_json=$WORK/checkpoint.json
+$SUDO $RUNTIME --root $WORK/state.reset checkpoint --json c5 cp1 > "$checkpoint_json"
+check "checkpoint records immutable lower layer chain" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$checkpoint_json\")); sys.exit(0 if j[\"checkpointed\"] is True and j[\"backend\"] == \"overlayfs\" and len(j[\"lowerdirs\"]) >= 2 else 1)' && $SUDO test -d $WORK/state.reset/.checkpoints/cp1/layer"
+fork_cp_a_json=$WORK/fork-checkpoint-a.json
+fork_cp_b_json=$WORK/fork-checkpoint-b.json
+$SUDO $RUNTIME --root $WORK/state.reset fork-checkpoint --json cp1 c8 > "$fork_cp_a_json"
+$SUDO $RUNTIME --root $WORK/state.reset fork-checkpoint --json cp1 c9 > "$fork_cp_b_json"
+check "fork-checkpoint starts branches with empty writable uppers" \
+  "python3 -c 'import json,sys; a=json.load(open(\"$fork_cp_a_json\")); b=json.load(open(\"$fork_cp_b_json\")); sys.exit(0 if a[\"forked\"] is True and b[\"forked\"] is True and len(a[\"lowerdirs\"]) >= 2 and len(b[\"lowerdirs\"]) >= 2 else 1)' && [[ $($SUDO find $WORK/state.reset/c8/overlay/upper -mindepth 1 | wc -l) -eq 0 ]] && [[ $($SUDO find $WORK/state.reset/c9/overlay/upper -mindepth 1 | wc -l) -eq 0 ]]"
+echo checkpoint-branch | $SUDO tee "$WORK/state.reset/c8/overlay/merged/checkpoint_branch" >/dev/null
+check "fork-checkpoint branches do not share writable state" \
+  "$SUDO test -e $WORK/state.reset/c8/overlay/merged/checkpoint_branch && $SUDO test ! -e $WORK/state.reset/c9/overlay/merged/checkpoint_branch && $SUDO test ! -e $WORK/state.reset/.checkpoints/cp1/layer/checkpoint_branch"
+checkpoint2_json=$WORK/checkpoint2.json
+$SUDO $RUNTIME --root $WORK/state.reset checkpoint --json c8 cp2 > "$checkpoint2_json"
+fork_cp2_json=$WORK/fork-checkpoint-c.json
+$SUDO $RUNTIME --root $WORK/state.reset fork-checkpoint --json cp2 c10 > "$fork_cp2_json"
+check "fork-checkpoint supports multiple lowerdirs" \
+  "python3 -c 'import json,sys; cp=json.load(open(\"$checkpoint2_json\")); f=json.load(open(\"$fork_cp2_json\")); sys.exit(0 if cp[\"checkpointed\"] is True and len(cp[\"lowerdirs\"]) >= 3 and f[\"forked\"] is True and len(f[\"lowerdirs\"]) >= 3 else 1)' && $SUDO test -f $WORK/state.reset/c10/overlay/merged/checkpoint_branch && $SUDO test -f $WORK/state.reset/c10/overlay/merged/added && [[ $($SUDO find $WORK/state.reset/c10/overlay/upper -mindepth 1 | wc -l) -eq 0 ]]"
+echo nested-branch | $SUDO tee "$WORK/state.reset/c10/overlay/merged/nested_branch" >/dev/null
+check "multi-lowerdir branch writes stay in newest upper" \
+  "$SUDO test -e $WORK/state.reset/c10/overlay/upper/nested_branch && $SUDO test ! -e $WORK/state.reset/.checkpoints/cp2/layer/nested_branch && $SUDO test ! -e $WORK/state.reset/c8/overlay/merged/nested_branch"
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c6
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c7
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c8
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c9
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c10
+reset_json=$WORK/reset.json
+$SUDO $RUNTIME --root $WORK/state.reset reset --json c5 > "$reset_json"
+check "reset reports overlayfs backend" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$reset_json\")); sys.exit(0 if j[\"backend\"] == \"overlayfs\" and j[\"reset\"] is True and j[\"resetCount\"] == 1 else 1)'"
+check "reset removed marker from merged rootfs" \
+  "$SUDO test ! -e $WORK/state.reset/c5/overlay/merged/added && $SUDO test -e $WORK/state.reset/c5/overlay/merged/remove_me"
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c5
+
+# ── 6. cleanup ─────────────────────────────────────────────────────────
 $SUDO rm -rf "$WORK"
 
 echo

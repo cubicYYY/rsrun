@@ -14,6 +14,10 @@ pub struct Spec {
     pub terminal: bool,
     pub root_path: PathBuf,
     pub root_readonly: bool,
+    /// rsrun extension for rollout workloads. When set to overlayfs,
+    /// the runtime mounts `lowerdir + upperdir + workdir` at `merged`
+    /// and uses that merged path as the container rootfs.
+    pub rootfs_backend: Option<RootfsBackendSpec>,
     pub hostname: String,
     pub namespaces: Vec<NamespaceEntry>,
     pub mounts: Vec<MountSpec>,
@@ -65,6 +69,15 @@ pub struct Spec {
     /// commands and seccomp profile paths may be resolved relative
     /// to this.
     pub bundle: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootfsBackendSpec {
+    pub backend: String,
+    pub lowerdir: Option<PathBuf>,
+    pub upperdir: Option<PathBuf>,
+    pub workdir: Option<PathBuf>,
+    pub merged: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +270,7 @@ impl Spec {
             .get("readonly")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let rootfs_backend = parse_rootfs_backend(v.get("rsrun"))?;
 
         let hostname = v
             .get("hostname")
@@ -366,6 +380,7 @@ impl Spec {
             terminal,
             root_path,
             root_readonly,
+            rootfs_backend,
             hostname,
             namespaces,
             mounts,
@@ -390,6 +405,35 @@ impl Spec {
             bundle: bundle.to_path_buf(),
         })
     }
+}
+
+fn parse_rootfs_backend(rsrun: Option<&Value>) -> std::io::Result<Option<RootfsBackendSpec>> {
+    let Some(rootfs) = rsrun.and_then(|v| v.get("rootfs")).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let backend = rootfs
+        .get("backend")
+        .and_then(Value::as_str)
+        .ok_or_else(missing("rsrun.rootfs.backend"))?;
+    if backend != "overlayfs" {
+        return Err(std::io::Error::other(format!(
+            "rsrun.rootfs.backend {backend} is not supported"
+        )));
+    }
+    let path = |key: &str| -> Option<PathBuf> {
+        rootfs
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    Ok(Some(RootfsBackendSpec {
+        backend: backend.to_string(),
+        lowerdir: path("lowerdir"),
+        upperdir: path("upperdir"),
+        workdir: path("workdir"),
+        merged: path("merged"),
+    }))
 }
 
 fn parse_scheduler(v: &Value) -> std::io::Result<SchedulerSpec> {
@@ -620,6 +664,40 @@ mod tests {
         });
         let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
         assert_eq!(spec.root_path, Path::new("/abs/rootfs"));
+    }
+
+    #[test]
+    fn parses_overlayfs_rootfs_extension() {
+        let v = json!({
+            "process": {"args": ["/bin/true"]},
+            "root": {"path": "rootfs"},
+            "rsrun": {
+                "rootfs": {
+                    "backend": "overlayfs",
+                    "lowerdir": "base",
+                    "upperdir": "overlay/upper",
+                    "workdir": "overlay/work",
+                    "merged": "overlay/merged"
+                }
+            }
+        });
+        let spec = Spec::from_value(v, Path::new("/bundle")).unwrap();
+        let rootfs = spec.rootfs_backend.unwrap();
+        assert_eq!(rootfs.backend, "overlayfs");
+        assert_eq!(rootfs.lowerdir.as_deref(), Some(Path::new("base")));
+        assert_eq!(rootfs.upperdir.as_deref(), Some(Path::new("overlay/upper")));
+        assert_eq!(rootfs.workdir.as_deref(), Some(Path::new("overlay/work")));
+        assert_eq!(rootfs.merged.as_deref(), Some(Path::new("overlay/merged")));
+    }
+
+    #[test]
+    fn rejects_unknown_rootfs_backend() {
+        let v = json!({
+            "process": {"args": ["/bin/true"]},
+            "root": {"path": "rootfs"},
+            "rsrun": {"rootfs": {"backend": "otherfs"}}
+        });
+        assert!(Spec::from_value(v, Path::new("/bundle")).is_err());
     }
 
     #[test]

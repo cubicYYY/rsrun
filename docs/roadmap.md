@@ -43,10 +43,37 @@ rollout use. They intentionally sit ahead of broad crun parity.
 
 - `validate-bundle <bundle> --json` to reject unsupported bundles
   before a rollout starts.
-- Overlay-backed writable rootfs mode for cheap reset and diff.
-- `changed-files`, `diff`, and `export-diff` for patch extraction.
-- Filesystem-level `snapshot`, `restore`, and `fork`; CRIU remains a
-  later optional path.
+- ✅ Overlay-backed writable rootfs mode for cheap reset:
+  rsrun should own the per-episode overlay upperdir/workdir and state
+  metadata, while the lower rootfs remains a prepared OCI bundle path.
+  Model this as a writable-rootfs backend so overlayfs is the first
+  implementation, not the only possible filesystem strategy.
+- ✅ `changed-files`, `diff`, and `export-diff --format tar|json` for
+  overlayfs-backed patch extraction.
+- ✅ Filesystem-level `snapshot`, `restore`, and `fork` by cloning the
+  overlay upperdir with reflink when available and copy fallback; CRIU
+  remains a later optional path.
+- ✅ High-fanout filesystem checkpoints: `checkpoint` freezes the current
+  upperdir as a read-only lower layer, while `fork-checkpoint` creates a
+  new branch with an empty writable upperdir over the checkpoint chain.
+- ✅ `mark` and `effects --since <marker> --json` compare current
+  overlayfs effects against a named filesystem marker for rollout
+  control and debugging.
+- `clone3(CLONE_INTO_CGROUP)` once cgroup placement shows up in the
+  agent hot path, to avoid a post-fork cgroup join.
+
+### Storage scope
+
+Near-term rsrun work should implement overlayfs as the first
+writable-rootfs backend. It should support per-episode upperdir/workdir
+state, cheap reset, diff, and export while keeping the lower rootfs as a
+prepared OCI bundle path.
+
+The implementation should keep a small backend boundary around mount,
+diff, export, and cleanup operations so other filesystem strategies can
+be added later. Read-only image-layer composition, multi-device backing
+stores, and Docker storage-driver integration stay out of P1 unless a
+deployment proves rsrun itself must prepare lower layers.
 
 ## Production-readiness — what's still missing
 
@@ -149,6 +176,26 @@ These don't affect the bench numbers because none of them touch the
 
 ### Namespaces / mounts
 - All seven namespaces; rootful and rootless (single user namespace).
+- Opt-in overlayfs writable rootfs backend via `rsrun.rootfs.backend =
+  "overlayfs"` plus `rsrun reset <id>` for stopped containers. The
+  runtime records upper/work/merged paths under container state and
+  refuses to reset arbitrary host paths.
+- Overlayfs-native `changed-files`, `diff`, and `export-diff` walk only
+  the recorded upperdir. Deletions are exported as portable tar
+  whiteouts; optional text patch generation remains future work.
+- Filesystem `snapshot`, `restore`, and `fork` clone only the recorded
+  overlay upperdir, preserve overlay metadata, and mount a new stopped
+  overlay state without sharing writable files.
+- Filesystem `checkpoint` and `fork-checkpoint` avoid per-branch
+  checkpoint copies by turning each checkpoint delta into a read-only
+  lower layer and giving each rollout branch a fresh empty upperdir.
+  Checkpoint metadata records backend, storage format, local layer path,
+  and the effective lowerdir chain so another read-only layer store can
+  be wired in later.
+- Filesystem `mark` and `effects` persist named overlay baselines and
+  report post-marker changed paths, sensitive path touches, and
+  approximate written bytes. Process, network, and IO accounting remain
+  explicit future extensions.
 - `linux.namespaces[].path` — joining a pre-existing namespace via
   `setns(2)`. PID-ns join works (post-clone3 child re-forks once when
   joining `pid`, mirroring crun).
