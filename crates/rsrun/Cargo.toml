@@ -30,6 +30,7 @@ default = [
     "sysctl",
     "lsm",
     "systemd-cgroup",
+    "rollout",
 ]
 seccomp = ["rsrun-ext/seccomp"]
 cgroup-limits = ["rsrun-ext/cgroup-limits"]
@@ -41,6 +42,7 @@ stats = ["rsrun-core/stats"]
 sysctl = ["rsrun-core/sysctl"]
 lsm = ["rsrun-core/lsm"]
 systemd-cgroup = ["rsrun-core/systemd-cgroup"]
+rollout = ["rsrun-core/rollout"]
 
 [dependencies]
 nix.workspace = true

@@ -3,6 +3,7 @@
 use rsrun_core as runtime;
 
 use clap::{Parser, Subcommand};
+#[cfg(feature = "rollout")]
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -84,32 +85,38 @@ enum Cmd {
         id: String,
     },
     /// Reset an overlayfs-backed stopped container rootfs.
+    #[cfg(feature = "rollout")]
     Reset {
         #[arg(long)]
         json: bool,
         id: String,
     },
     /// List changed files for an overlayfs-backed container.
+    #[cfg(feature = "rollout")]
     ChangedFiles {
         #[arg(long)]
         json: bool,
         id: String,
     },
     /// Print filesystem diff metadata for an overlayfs-backed container.
+    #[cfg(feature = "rollout")]
     Diff {
         #[arg(long)]
         json: bool,
         id: String,
     },
     /// Export an overlayfs diff.
+    #[cfg(feature = "rollout")]
     ExportDiff {
         #[arg(long, default_value = "tar")]
         format: String,
         id: String,
     },
     /// Save a named filesystem marker for later effects comparison.
+    #[cfg(feature = "rollout")]
     Mark { id: String, name: String },
     /// Show filesystem effects since a named marker.
+    #[cfg(feature = "rollout")]
     Effects {
         #[arg(long)]
         since: String,
@@ -118,8 +125,10 @@ enum Cmd {
         id: String,
     },
     /// Snapshot the filesystem state of an overlayfs-backed stopped container.
+    #[cfg(feature = "rollout")]
     Snapshot { id: String, snapshot_id: String },
     /// Save the current writable layer as an immutable checkpoint layer.
+    #[cfg(feature = "rollout")]
     Checkpoint {
         #[arg(long)]
         json: bool,
@@ -127,6 +136,7 @@ enum Cmd {
         checkpoint_id: String,
     },
     /// Restore a filesystem snapshot as a new stopped overlayfs-backed state.
+    #[cfg(feature = "rollout")]
     Restore {
         #[arg(long)]
         json: bool,
@@ -134,6 +144,7 @@ enum Cmd {
         new_id: String,
     },
     /// Fork a checkpoint into a new stopped state with an empty writable layer.
+    #[cfg(feature = "rollout")]
     ForkCheckpoint {
         #[arg(long)]
         json: bool,
@@ -141,6 +152,7 @@ enum Cmd {
         new_id: String,
     },
     /// Fork a stopped overlayfs-backed container filesystem into a new state.
+    #[cfg(feature = "rollout")]
     Fork {
         #[arg(long)]
         json: bool,
@@ -156,7 +168,7 @@ enum Cmd {
         signal: String,
     },
     /// Run a process inside a running container (the CVE-2019-5736 path).
-    #[command(trailing_var_arg = true)]
+    #[cfg_attr(feature = "rollout", command(trailing_var_arg = true))]
     Exec {
         #[arg(short = 'p', long)]
         process: Option<PathBuf>,
@@ -164,19 +176,24 @@ enum Cmd {
         pid_file: Option<PathBuf>,
         #[arg(short, long)]
         detach: bool,
-        /// Agent mode: maximum wall time before terminating the exec.
+        /// Rollout mode: maximum wall time before terminating the exec.
+        #[cfg(feature = "rollout")]
         #[arg(long)]
         timeout: Option<String>,
-        /// Agent mode: signal the exec process group on timeout.
+        /// Rollout mode: signal the exec process group on timeout.
+        #[cfg(feature = "rollout")]
         #[arg(long = "kill-tree")]
         kill_tree: bool,
-        /// Agent mode: per-stream captured output limit.
+        /// Rollout mode: per-stream captured output limit.
+        #[cfg(feature = "rollout")]
         #[arg(long = "max-output-bytes", default_value_t = 2 * 1024 * 1024)]
         max_output_bytes: usize,
-        /// Agent mode: emit a structured result object.
+        /// Rollout mode: emit a structured result object.
+        #[cfg(feature = "rollout")]
         #[arg(long)]
         json: bool,
-        /// Agent mode: read stdin payload from a file, or `-` for stdin.
+        /// Rollout mode: read stdin payload from a file, or `-` for stdin.
+        #[cfg(feature = "rollout")]
         #[arg(long)]
         stdin: Option<PathBuf>,
         // Args below accepted for engine compatibility but unused here.
@@ -203,7 +220,8 @@ enum Cmd {
         #[arg(long = "preserve-fds")]
         _preserve_fds: Option<String>,
         id: String,
-        /// Agent mode command. Use `--` before the command.
+        /// Rollout mode command. Use `--` before the command.
+        #[cfg(feature = "rollout")]
         command: Vec<String>,
     },
     /// Emit the runtime feature descriptor JSON Docker queries at registration.
@@ -301,29 +319,40 @@ fn main() -> ExitCode {
             .and_then(|timeout_ms| runtime::cmd_start_with_timeout(&id, timeout_ms)),
         Cmd::Delete { force, timeout, id } => parse_optional_duration_ms(timeout.as_deref())
             .and_then(|timeout_ms| runtime::cmd_delete_with_timeout(&id, force, timeout_ms)),
-        Cmd::Reset { json, id } => runtime::cmd_reset(&id, json),
-        Cmd::ChangedFiles { json, id } => runtime::cmd_changed_files(&id, json),
-        Cmd::Diff { json, id } => runtime::cmd_diff(&id, json),
-        Cmd::ExportDiff { format, id } => runtime::cmd_export_diff(&id, &format),
-        Cmd::Mark { id, name } => runtime::cmd_mark(&id, &name),
-        Cmd::Effects { since, json, id } => runtime::cmd_effects(&id, &since, json),
-        Cmd::Snapshot { id, snapshot_id } => runtime::cmd_snapshot(&id, &snapshot_id),
+        #[cfg(feature = "rollout")]
+        Cmd::Reset { json, id } => runtime::rollout::cmd_reset(&id, json),
+        #[cfg(feature = "rollout")]
+        Cmd::ChangedFiles { json, id } => runtime::rollout::cmd_changed_files(&id, json),
+        #[cfg(feature = "rollout")]
+        Cmd::Diff { json, id } => runtime::rollout::cmd_diff(&id, json),
+        #[cfg(feature = "rollout")]
+        Cmd::ExportDiff { format, id } => runtime::rollout::cmd_export_diff(&id, &format),
+        #[cfg(feature = "rollout")]
+        Cmd::Mark { id, name } => runtime::rollout::cmd_mark(&id, &name),
+        #[cfg(feature = "rollout")]
+        Cmd::Effects { since, json, id } => runtime::rollout::cmd_effects(&id, &since, json),
+        #[cfg(feature = "rollout")]
+        Cmd::Snapshot { id, snapshot_id } => runtime::rollout::cmd_snapshot(&id, &snapshot_id),
+        #[cfg(feature = "rollout")]
         Cmd::Checkpoint {
             json,
             id,
             checkpoint_id,
-        } => runtime::cmd_checkpoint(&id, &checkpoint_id, json),
+        } => runtime::rollout::cmd_checkpoint(&id, &checkpoint_id, json),
+        #[cfg(feature = "rollout")]
         Cmd::Restore {
             json,
             snapshot_id,
             new_id,
-        } => runtime::cmd_restore(&snapshot_id, &new_id, json),
+        } => runtime::rollout::cmd_restore(&snapshot_id, &new_id, json),
+        #[cfg(feature = "rollout")]
         Cmd::ForkCheckpoint {
             json,
             checkpoint_id,
             new_id,
-        } => runtime::cmd_fork_checkpoint(&checkpoint_id, &new_id, json),
-        Cmd::Fork { json, id, new_id } => runtime::cmd_fork(&id, &new_id, json),
+        } => runtime::rollout::cmd_fork_checkpoint(&checkpoint_id, &new_id, json),
+        #[cfg(feature = "rollout")]
+        Cmd::Fork { json, id, new_id } => runtime::rollout::cmd_fork(&id, &new_id, json),
         Cmd::State { id } => runtime::cmd_state(&id),
         Cmd::Kill { id, signal } => runtime::cmd_kill(&id, &signal),
         Cmd::Exec {
@@ -332,27 +361,34 @@ fn main() -> ExitCode {
             detach,
             id,
             console_socket,
+            #[cfg(feature = "rollout")]
             timeout,
+            #[cfg(feature = "rollout")]
             kill_tree,
+            #[cfg(feature = "rollout")]
             max_output_bytes,
+            #[cfg(feature = "rollout")]
             json,
+            #[cfg(feature = "rollout")]
             stdin,
             cwd,
             env,
+            #[cfg(feature = "rollout")]
             command,
             ..
         } => (|| -> std::io::Result<()> {
+            #[cfg(feature = "rollout")]
             if !command.is_empty() {
                 if detach {
                     Err(std::io::Error::other(
-                        "agent exec command form does not support --detach",
+                        "direct exec command form does not support --detach",
                     ))
                 } else if console_socket.is_some() {
                     Err(std::io::Error::other(
-                        "agent exec command form does not support --console-socket",
+                        "direct exec command form does not support --console-socket",
                     ))
                 } else {
-                    let opts = runtime::AgentExecOpts {
+                    let opts = runtime::rollout::RolloutExecOpts {
                         timeout_ms: match timeout.as_deref() {
                             Some(s) => Some(parse_duration_ms(s)?),
                             None => None,
@@ -364,11 +400,26 @@ fn main() -> ExitCode {
                         json,
                         stdin: read_exec_stdin(stdin.as_deref())?,
                     };
-                    runtime::cmd_exec_agent(&id, &command, opts)
+                    runtime::rollout::cmd_exec_rollout(&id, &command, opts)
                 }
             } else {
+                let _ = (&cwd, &env);
                 let process = process.ok_or_else(|| {
                     std::io::Error::other("exec requires either -p/--process or a command after --")
+                })?;
+                runtime::cmd_exec_full(
+                    &id,
+                    &process,
+                    pid_file.as_deref(),
+                    detach,
+                    console_socket.as_deref(),
+                )
+            }
+            #[cfg(not(feature = "rollout"))]
+            {
+                let _ = (&cwd, &env);
+                let process = process.ok_or_else(|| {
+                    std::io::Error::other("exec requires -p/--process in this build")
                 })?;
                 runtime::cmd_exec_full(
                     &id,
@@ -463,6 +514,7 @@ fn parse_optional_duration_ms(s: Option<&str>) -> std::io::Result<Option<u64>> {
     s.map(parse_duration_ms).transpose()
 }
 
+#[cfg(feature = "rollout")]
 fn read_exec_stdin(path: Option<&std::path::Path>) -> std::io::Result<Option<Vec<u8>>> {
     let Some(path) = path else {
         return Ok(None);

@@ -27,6 +27,9 @@ sysctl = []
 lsm = []
 # --systemd-cgroup driver (shells out to systemd-run on `create`).
 systemd-cgroup = []
+# Rollout filesystem/state extensions. Keep this separate from the
+# OCI lifecycle so Docker-runtime builds can omit it.
+rollout = []
 
 [dependencies]
 nix.workspace = true

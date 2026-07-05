@@ -5,6 +5,12 @@ mounts, caps, exec). Heavier features live in `rsrun-ext`, all gated
 as default-on Cargo features so the binary can be slimmed by opting
 out.
 
+Rollout filesystem/state extensions are gated separately behind the
+`rollout` Cargo feature and exported through `rsrun_core::rollout`.
+The Docker/OCI runtime surface must remain usable without that feature;
+future rollout storage work should keep using this boundary instead of
+adding dependencies to the lifecycle hot path.
+
 There are two roadmap tracks:
 
 - **Agent rollout runtime**: [SPEC.md](../SPEC.md) is the primary
@@ -56,6 +62,10 @@ rollout use. They intentionally sit ahead of broad crun parity.
 - ✅ High-fanout filesystem checkpoints: `checkpoint` freezes the current
   upperdir as a read-only lower layer, while `fork-checkpoint` creates a
   new branch with an empty writable upperdir over the checkpoint chain.
+- Next local-storage gap: pack checkpoint deltas into read-only image
+  layers, resolve/mount those layers as lower roots, and compact long
+  chains. This closes the single-host layer-format gap without adding
+  distributed storage.
 - ✅ `mark` and `effects --since <marker> --json` compare current
   overlayfs effects against a named filesystem marker for rollout
   control and debugging.
@@ -72,9 +82,22 @@ prepared OCI bundle path.
 
 The implementation should keep a small backend boundary around mount,
 diff, export, and cleanup operations so other filesystem strategies can
-be added later. Read-only image-layer composition, multi-device backing
-stores, and Docker storage-driver integration stay out of P1 unless a
-deployment proves rsrun itself must prepare lower layers.
+be added later. The next storage step is local-only packed read-only
+layers and compaction; distributed backing stores and Docker
+storage-driver integration stay out of scope unless a deployment proves
+rsrun itself must prepare those layers.
+
+Build boundary: all rollout-specific filesystem state commands
+(`reset`, `diff`, `export-diff`, `snapshot`, `checkpoint`,
+`fork-checkpoint`, `mark`, `effects`) belong behind `rollout`.
+The OCI lifecycle commands (`create`, `start`, `state`, `kill`,
+`delete`, `exec -p`, `pause`, `resume`, `update`, `stats`, `events`)
+must continue to compile and run without it.
+
+Before adding packed layers, move the internal rollout filesystem
+helper implementation out of `runtime.rs` into a dedicated implementation
+module or crate. The feature flag should stay coarse; avoid spreading
+per-function cfg logic through the lifecycle hot path.
 
 ## Production-readiness — what's still missing
 
@@ -197,12 +220,58 @@ These don't affect the bench numbers because none of them touch the
   report post-marker changed paths, sensitive path touches, and
   approximate written bytes. Process, network, and IO accounting remain
   explicit future extensions.
+- Local packed checkpoint layers remain the next filesystem-state step:
+  checkpoint deltas should be packable into immutable read-only images
+  and later resolved into mounted lower roots for `fork-checkpoint`.
 - `linux.namespaces[].path` — joining a pre-existing namespace via
   `setns(2)`. PID-ns join works (post-clone3 child re-forks once when
   joining `pid`, mirroring crun).
 - `linux.rootfsPropagation` modes (shared / slave / private /
   unbindable + `r*` recursive).
 - `linux.sysctl` writes inside the new namespaces.
+
+### Next Storage Milestone — Local Packed Layers
+
+Goal: close the local layer-format gap without introducing distributed
+storage. `rsrun` should be able to commit checkpoint deltas as immutable
+read-only image files, mount them locally, and compose future branches
+from those mounted roots plus a fresh writable upperdir.
+
+Proposed commands:
+
+```text
+rsrun checkpoint <id> <checkpoint-id> --pack directory|image
+rsrun fork-checkpoint <checkpoint-id> <new-id>
+rsrun compact-checkpoint <checkpoint-id> <new-checkpoint-id>
+```
+
+Implementation steps:
+
+1. Add `LayerRef` metadata with `format = overlay-upperdir |
+   readonly-image`, `store = local-directory | local-file`, and a
+   content/path identifier.
+2. Keep `--pack directory` as the current default.
+3. Implement `--pack image` by creating a local immutable image from the
+   checkpoint upperdir and storing it under `.checkpoints/<id>/`.
+4. Add a layer resolver that turns `LayerRef` entries into mounted
+   read-only directories under a runtime-owned mount cache.
+5. Teach `fork-checkpoint` to compose resolved layer mountpoints as
+   lowerdirs and keep each branch upperdir/workdir local and empty.
+6. Add `compact-checkpoint` to materialize a checkpoint chain and pack
+   it into one new read-only image when lowerdir count or mount-option
+   length crosses a configured threshold.
+
+Acceptance criteria:
+
+- Branch writes never target packed layers.
+- Reads from older checkpoint layers do not copy data into the branch
+  upperdir.
+- Deleted paths survive pack, resolve, fork, and compact through the
+  same whiteout semantics used by `export-diff`.
+- A chain of at least 100 logical checkpoints can be compacted into a
+  bounded number of mounted lower roots before fork.
+- The default OCI lifecycle path does not mount or inspect checkpoint
+  layers.
 
 ### Process / security
 - Capabilities (all five sets), rlimits, default `/dev`, masked +

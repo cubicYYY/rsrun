@@ -58,12 +58,17 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
 use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execve, execvpe, mkfifo, pivot_root, sethostname, Pid};
+#[cfg(feature = "rollout")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(feature = "rollout")]
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "rollout")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -121,7 +126,10 @@ pub fn cmd_create_full_with_timeout(
 ) -> std::io::Result<()> {
     let deadline = Deadline::from_timeout_ms(timeout_ms);
     let bundle = bundle.canonicalize()?;
+    #[cfg(feature = "rollout")]
     let mut spec = Spec::from_bundle(&bundle)?;
+    #[cfg(not(feature = "rollout"))]
+    let spec = Spec::from_bundle(&bundle)?;
     deadline.check("create")?;
 
     // Validate (type, path) pairs for namespace joins before doing any
@@ -172,11 +180,20 @@ pub fn cmd_create_full_with_timeout(
     mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)?;
     std::fs::set_permissions(&fifo_path, std::fs::Permissions::from_mode(0o600))?;
 
+    #[cfg(feature = "rollout")]
     let overlay = prepare_overlay_rootfs(&paths, &spec).map_err(|e| {
         let _ = cleanup_overlay_rootfs(&paths);
         let _ = paths.destroy();
         e
     })?;
+    #[cfg(not(feature = "rollout"))]
+    if spec.rootfs_backend.is_some() {
+        let _ = paths.destroy();
+        return Err(std::io::Error::other(
+            "rsrun.rootfs backend support requires the rollout feature",
+        ));
+    }
+    #[cfg(feature = "rollout")]
     if let Some(overlay) = overlay.as_ref() {
         spec.root_path = overlay.merged.clone();
         write_overlay_state(&paths, overlay, 0).map_err(|e| {
@@ -605,6 +622,7 @@ fn load_hooks(paths: &ContainerPaths) -> crate::plan::Hooks {
     crate::plan::Hooks::from_json(&v)
 }
 
+#[cfg(feature = "rollout")]
 #[derive(Debug, Clone)]
 struct OverlayRootfs {
     lowerdirs: Vec<PathBuf>,
@@ -613,6 +631,7 @@ struct OverlayRootfs {
     merged: PathBuf,
 }
 
+#[cfg(feature = "rollout")]
 fn prepare_overlay_rootfs(
     paths: &ContainerPaths,
     spec: &Spec,
@@ -635,6 +654,7 @@ fn prepare_overlay_rootfs(
     Ok(Some(overlay))
 }
 
+#[cfg(feature = "rollout")]
 fn overlay_paths(paths: &ContainerPaths, spec: &Spec) -> std::io::Result<OverlayRootfs> {
     let cfg = spec
         .rootfs_backend
@@ -656,6 +676,7 @@ fn overlay_paths(paths: &ContainerPaths, spec: &Spec) -> std::io::Result<Overlay
     })
 }
 
+#[cfg(feature = "rollout")]
 fn resolve_bundle_path(bundle: &Path, path: &Path) -> std::io::Result<PathBuf> {
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -665,6 +686,7 @@ fn resolve_bundle_path(bundle: &Path, path: &Path) -> std::io::Result<PathBuf> {
     candidate.canonicalize()
 }
 
+#[cfg(feature = "rollout")]
 fn resolve_state_path(
     paths: &ContainerPaths,
     configured: Option<&Path>,
@@ -677,6 +699,7 @@ fn resolve_state_path(
     }
 }
 
+#[cfg(feature = "rollout")]
 fn validate_overlay_paths(paths: &ContainerPaths, overlay: &OverlayRootfs) -> std::io::Result<()> {
     if overlay.lowerdirs.is_empty() {
         return Err(std::io::Error::other("overlay lowerdir chain is empty"));
@@ -718,6 +741,7 @@ fn validate_overlay_paths(paths: &ContainerPaths, overlay: &OverlayRootfs) -> st
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -745,6 +769,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     Ok(out)
 }
 
+#[cfg(feature = "rollout")]
 fn reject_overlay_option_chars(path: &Path) -> std::io::Result<()> {
     let s = path.as_os_str().to_string_lossy();
     if s.contains(',') || s.contains('\n') || s.contains('\0') {
@@ -756,6 +781,7 @@ fn reject_overlay_option_chars(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn reject_overlay_lowerdir_chars(path: &Path) -> std::io::Result<()> {
     reject_overlay_option_chars(path)?;
     let s = path.as_os_str().to_string_lossy();
@@ -811,6 +837,7 @@ fn clone_into_cgroup_enabled() -> bool {
     )
 }
 
+#[cfg(feature = "rollout")]
 fn mount_overlay(overlay: &OverlayRootfs) -> std::io::Result<()> {
     let lowerdir = overlay
         .lowerdirs
@@ -834,6 +861,7 @@ fn mount_overlay(overlay: &OverlayRootfs) -> std::io::Result<()> {
     .map_err(std::io::Error::other)
 }
 
+#[cfg(feature = "rollout")]
 fn write_overlay_state(
     paths: &ContainerPaths,
     overlay: &OverlayRootfs,
@@ -851,6 +879,7 @@ fn write_overlay_state(
     std::fs::write(paths.root.join("overlay.json"), serde_json::to_vec(&value)?)
 }
 
+#[cfg(feature = "rollout")]
 fn read_overlay_state(paths: &ContainerPaths) -> std::io::Result<(OverlayRootfs, u64)> {
     let bytes = std::fs::read(paths.root.join("overlay.json"))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -891,6 +920,7 @@ fn read_overlay_state(paths: &ContainerPaths) -> std::io::Result<(OverlayRootfs,
     ))
 }
 
+#[cfg(feature = "rollout")]
 fn cleanup_overlay_rootfs(paths: &ContainerPaths) -> std::io::Result<()> {
     let Ok((overlay, _)) = read_overlay_state(paths) else {
         return Ok(());
@@ -898,6 +928,12 @@ fn cleanup_overlay_rootfs(paths: &ContainerPaths) -> std::io::Result<()> {
     unmount_overlay(&overlay)
 }
 
+#[cfg(not(feature = "rollout"))]
+fn cleanup_overlay_rootfs(_paths: &ContainerPaths) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "rollout")]
 fn unmount_overlay(overlay: &OverlayRootfs) -> std::io::Result<()> {
     match umount2(&overlay.merged, MntFlags::MNT_DETACH) {
         Ok(()) => Ok(()),
@@ -906,6 +942,7 @@ fn unmount_overlay(overlay: &OverlayRootfs) -> std::io::Result<()> {
     }
 }
 
+#[cfg(feature = "rollout")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DiffKind {
     Added,
@@ -914,6 +951,7 @@ enum DiffKind {
     OpaqueDir,
 }
 
+#[cfg(feature = "rollout")]
 impl DiffKind {
     fn as_str(&self) -> &'static str {
         match self {
@@ -925,6 +963,7 @@ impl DiffKind {
     }
 }
 
+#[cfg(feature = "rollout")]
 #[derive(Debug, Clone)]
 struct DiffEntry {
     path: String,
@@ -938,6 +977,7 @@ struct DiffEntry {
     upper_path: Option<PathBuf>,
 }
 
+#[cfg(feature = "rollout")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MarkEntry {
     path: String,
@@ -947,6 +987,7 @@ struct MarkEntry {
     fingerprint: String,
 }
 
+#[cfg(feature = "rollout")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectEntry {
     path: String,
@@ -956,6 +997,7 @@ struct EffectEntry {
     bytes_written: u64,
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_changed_files(id: &str, json: bool) -> std::io::Result<()> {
     let paths = ContainerPaths::for_id(id);
     let (overlay, _) = read_overlay_state(&paths)?;
@@ -973,6 +1015,7 @@ pub fn cmd_changed_files(id: &str, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_diff(id: &str, json: bool) -> std::io::Result<()> {
     let paths = ContainerPaths::for_id(id);
     let (overlay, _) = read_overlay_state(&paths)?;
@@ -992,6 +1035,7 @@ pub fn cmd_diff(id: &str, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_export_diff(id: &str, format: &str) -> std::io::Result<()> {
     let paths = ContainerPaths::for_id(id);
     let (overlay, _) = read_overlay_state(&paths)?;
@@ -1015,6 +1059,7 @@ pub fn cmd_export_diff(id: &str, format: &str) -> std::io::Result<()> {
     }
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_mark(id: &str, name: &str) -> std::io::Result<()> {
     validate_state_name(name, "marker name")?;
     let paths = ContainerPaths::for_id(id);
@@ -1024,6 +1069,7 @@ pub fn cmd_mark(id: &str, name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_effects(id: &str, since: &str, json: bool) -> std::io::Result<()> {
     validate_state_name(since, "marker name")?;
     let paths = ContainerPaths::for_id(id);
@@ -1056,6 +1102,7 @@ pub fn cmd_effects(id: &str, since: &str, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_snapshot(id: &str, snapshot_id: &str) -> std::io::Result<()> {
     validate_state_name(snapshot_id, "snapshot id")?;
     let paths = ContainerPaths::for_id(id);
@@ -1090,6 +1137,7 @@ pub fn cmd_snapshot(id: &str, snapshot_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_restore(snapshot_id: &str, new_id: &str, json: bool) -> std::io::Result<()> {
     validate_state_name(snapshot_id, "snapshot id")?;
     validate_state_name(new_id, "container id")?;
@@ -1115,6 +1163,7 @@ pub fn cmd_restore(snapshot_id: &str, new_id: &str, json: bool) -> std::io::Resu
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_fork(id: &str, new_id: &str, json: bool) -> std::io::Result<()> {
     validate_state_name(new_id, "container id")?;
     let source_paths = ContainerPaths::for_id(id);
@@ -1163,6 +1212,7 @@ pub fn cmd_fork(id: &str, new_id: &str, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_checkpoint(id: &str, checkpoint_id: &str, json: bool) -> std::io::Result<()> {
     validate_state_name(checkpoint_id, "checkpoint id")?;
     let paths = ContainerPaths::for_id(id);
@@ -1225,6 +1275,7 @@ pub fn cmd_checkpoint(id: &str, checkpoint_id: &str, json: bool) -> std::io::Res
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_fork_checkpoint(checkpoint_id: &str, new_id: &str, json: bool) -> std::io::Result<()> {
     validate_state_name(checkpoint_id, "checkpoint id")?;
     validate_state_name(new_id, "container id")?;
@@ -1273,30 +1324,35 @@ pub fn cmd_fork_checkpoint(checkpoint_id: &str, new_id: &str, json: bool) -> std
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 struct SnapshotPaths {
     root: PathBuf,
     upper: PathBuf,
     meta: PathBuf,
 }
 
+#[cfg(feature = "rollout")]
 struct CheckpointPaths {
     root: PathBuf,
     layer: PathBuf,
     meta: PathBuf,
 }
 
+#[cfg(feature = "rollout")]
 struct SnapshotMeta {
     lowerdirs: Vec<PathBuf>,
     bundle: PathBuf,
     reset_count: u64,
 }
 
+#[cfg(feature = "rollout")]
 struct CheckpointMeta {
     lowerdirs: Vec<PathBuf>,
     bundle: PathBuf,
     reset_count: u64,
 }
 
+#[cfg(feature = "rollout")]
 fn snapshot_paths(snapshot_id: &str) -> std::io::Result<SnapshotPaths> {
     let base = runtime_root_dir()?.join(".snapshots").join(snapshot_id);
     Ok(SnapshotPaths {
@@ -1306,6 +1362,7 @@ fn snapshot_paths(snapshot_id: &str) -> std::io::Result<SnapshotPaths> {
     })
 }
 
+#[cfg(feature = "rollout")]
 fn checkpoint_paths(checkpoint_id: &str) -> std::io::Result<CheckpointPaths> {
     let base = runtime_root_dir()?.join(".checkpoints").join(checkpoint_id);
     Ok(CheckpointPaths {
@@ -1315,6 +1372,7 @@ fn checkpoint_paths(checkpoint_id: &str) -> std::io::Result<CheckpointPaths> {
     })
 }
 
+#[cfg(feature = "rollout")]
 fn runtime_root_dir() -> std::io::Result<PathBuf> {
     let dummy = ContainerPaths::for_id("__rsrun_root__");
     dummy
@@ -1324,6 +1382,7 @@ fn runtime_root_dir() -> std::io::Result<PathBuf> {
         .ok_or_else(|| std::io::Error::other("invalid runtime root"))
 }
 
+#[cfg(feature = "rollout")]
 fn read_snapshot_meta(paths: &SnapshotPaths) -> std::io::Result<SnapshotMeta> {
     let bytes = std::fs::read(&paths.meta)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -1371,6 +1430,7 @@ fn read_snapshot_meta(paths: &SnapshotPaths) -> std::io::Result<SnapshotMeta> {
     })
 }
 
+#[cfg(feature = "rollout")]
 fn read_checkpoint_meta(paths: &CheckpointPaths) -> std::io::Result<CheckpointMeta> {
     let bytes = std::fs::read(&paths.meta)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -1417,6 +1477,7 @@ fn read_checkpoint_meta(paths: &CheckpointPaths) -> std::io::Result<CheckpointMe
     })
 }
 
+#[cfg(feature = "rollout")]
 fn restore_snapshot_into(
     snapshot: &SnapshotPaths,
     meta: &SnapshotMeta,
@@ -1449,6 +1510,7 @@ fn restore_snapshot_into(
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn ensure_checkpoint_quiescent(id: &str, paths: &ContainerPaths) -> std::io::Result<()> {
     if !paths.root.exists() {
         return Err(std::io::Error::other(format!(
@@ -1467,6 +1529,7 @@ fn ensure_checkpoint_quiescent(id: &str, paths: &ContainerPaths) -> std::io::Res
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn ensure_stopped_for_fs_state(id: &str, paths: &ContainerPaths, op: &str) -> std::io::Result<()> {
     if !paths.root.exists() {
         return Err(std::io::Error::other(format!(
@@ -1483,6 +1546,7 @@ fn ensure_stopped_for_fs_state(id: &str, paths: &ContainerPaths, op: &str) -> st
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn validate_state_name(name: &str, label: &str) -> std::io::Result<()> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(std::io::Error::other(format!("invalid {label}: {name}")));
@@ -1490,12 +1554,14 @@ fn validate_state_name(name: &str, label: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 #[derive(Clone, Copy)]
 struct SnapshotStats {
     entries: u64,
     bytes: u64,
 }
 
+#[cfg(feature = "rollout")]
 fn enforce_snapshot_limits(root: &Path) -> std::io::Result<SnapshotStats> {
     let stats = measure_upperdir(root)?;
     let max_bytes = snapshot_limit_env("RSRUN_SNAPSHOT_MAX_BYTES", 10 * 1024 * 1024 * 1024);
@@ -1515,6 +1581,7 @@ fn enforce_snapshot_limits(root: &Path) -> std::io::Result<SnapshotStats> {
     Ok(stats)
 }
 
+#[cfg(feature = "rollout")]
 fn snapshot_limit_env(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -1522,6 +1589,7 @@ fn snapshot_limit_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+#[cfg(feature = "rollout")]
 fn measure_upperdir(root: &Path) -> std::io::Result<SnapshotStats> {
     let mut stats = SnapshotStats {
         entries: 0,
@@ -1531,6 +1599,7 @@ fn measure_upperdir(root: &Path) -> std::io::Result<SnapshotStats> {
     Ok(stats)
 }
 
+#[cfg(feature = "rollout")]
 fn measure_upperdir_inner(path: &Path, stats: &mut SnapshotStats) -> std::io::Result<()> {
     let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -1548,6 +1617,7 @@ fn measure_upperdir_inner(path: &Path, stats: &mut SnapshotStats) -> std::io::Re
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn make_tree_readonly(root: &Path) -> std::io::Result<()> {
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -1566,6 +1636,7 @@ fn make_tree_readonly(root: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(meta.mode() & !0o222))
 }
 
+#[cfg(feature = "rollout")]
 fn clone_upperdir(src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() {
         return Err(std::io::Error::other(format!(
@@ -1579,6 +1650,7 @@ fn clone_upperdir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn clone_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut entries = std::fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -1590,6 +1662,7 @@ fn clone_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn clone_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
     let ft = meta.file_type();
@@ -1614,6 +1687,7 @@ fn clone_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn clone_regular_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     let src_file = std::fs::File::open(src)?;
     let dst_file = std::fs::OpenOptions::new()
@@ -1626,6 +1700,7 @@ fn clone_regular_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn reflink_file(src: &std::fs::File, dst: &std::fs::File) -> std::io::Result<()> {
     const FICLONE: libc::c_ulong = 0x4004_9409;
     let rc = unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) };
@@ -1635,6 +1710,7 @@ fn reflink_file(src: &std::fs::File, dst: &std::fs::File) -> std::io::Result<()>
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn clone_special_file(dst: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
     let path_c = CString::new(dst.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("path contains NUL"))?;
@@ -1652,6 +1728,7 @@ fn clone_special_file(dst: &Path, meta: &std::fs::Metadata) -> std::io::Result<(
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn copy_metadata(src: &Path, dst: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
     std::fs::set_permissions(dst, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
@@ -1659,6 +1736,7 @@ fn copy_metadata(src: &Path, dst: &Path) -> std::io::Result<()> {
     copy_xattrs(src, dst)
 }
 
+#[cfg(feature = "rollout")]
 fn copy_owner(_src: &Path, dst: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
     let dst_c = CString::new(dst.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("path contains NUL"))?;
@@ -1672,6 +1750,7 @@ fn copy_owner(_src: &Path, dst: &Path, meta: &std::fs::Metadata) -> std::io::Res
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn copy_xattrs(src: &Path, dst: &Path) -> std::io::Result<()> {
     let names = list_xattrs(src)?;
     for name in names {
@@ -1683,6 +1762,7 @@ fn copy_xattrs(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn list_xattrs(path: &Path) -> std::io::Result<Vec<String>> {
     let path_c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("path contains NUL"))?;
@@ -1710,6 +1790,7 @@ fn list_xattrs(path: &Path) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
+#[cfg(feature = "rollout")]
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     let path_c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("path contains NUL"))?;
@@ -1729,6 +1810,7 @@ fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn scan_overlay_diff(overlay: &OverlayRootfs) -> std::io::Result<Vec<DiffEntry>> {
     let mut entries = Vec::new();
     if !overlay.upperdir.exists() {
@@ -1743,6 +1825,7 @@ fn scan_overlay_diff(overlay: &OverlayRootfs) -> std::io::Result<Vec<DiffEntry>>
     Ok(entries)
 }
 
+#[cfg(feature = "rollout")]
 fn scan_overlay_dir(
     overlay: &OverlayRootfs,
     rel_dir: &Path,
@@ -1805,6 +1888,7 @@ fn scan_overlay_dir(
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn lower_metadata(
     overlay: &OverlayRootfs,
     rel: &Path,
@@ -1825,6 +1909,7 @@ fn lower_metadata(
     Ok(None)
 }
 
+#[cfg(feature = "rollout")]
 fn lower_hides_path(lowerdir: &Path, rel: &Path) -> std::io::Result<bool> {
     let mut ancestor = PathBuf::new();
     for component in rel.parent().into_iter().flat_map(Path::components) {
@@ -1843,6 +1928,7 @@ fn lower_hides_path(lowerdir: &Path, rel: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
+#[cfg(feature = "rollout")]
 fn diff_entry(
     overlay: &OverlayRootfs,
     rel: &Path,
@@ -1884,6 +1970,7 @@ fn diff_entry(
     }
 }
 
+#[cfg(feature = "rollout")]
 fn diff_fingerprint(file_type: &str, meta: &std::fs::Metadata) -> String {
     format!(
         "type={file_type}:mode={:o}:uid={}:gid={}:rdev={}:size={}:mtime={}.{}:ctime={}.{}",
@@ -1899,6 +1986,7 @@ fn diff_fingerprint(file_type: &str, meta: &std::fs::Metadata) -> String {
     )
 }
 
+#[cfg(feature = "rollout")]
 fn changed_files_json(id: &str, entries: &[DiffEntry]) -> serde_json::Value {
     serde_json::json!({
         "id": id,
@@ -1913,6 +2001,7 @@ fn changed_files_json(id: &str, entries: &[DiffEntry]) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "rollout")]
 fn diff_json(id: &str, entries: &[DiffEntry]) -> serde_json::Value {
     serde_json::json!({
         "id": id,
@@ -1931,10 +2020,12 @@ fn diff_json(id: &str, entries: &[DiffEntry]) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "rollout")]
 fn marker_path(paths: &ContainerPaths, name: &str) -> PathBuf {
     paths.root.join("markers").join(format!("{name}.json"))
 }
 
+#[cfg(feature = "rollout")]
 fn write_marker(
     paths: &ContainerPaths,
     id: &str,
@@ -1963,6 +2054,7 @@ fn write_marker(
     std::fs::write(marker_path(paths, name), serde_json::to_vec(&value)?)
 }
 
+#[cfg(feature = "rollout")]
 fn read_marker(paths: &ContainerPaths, name: &str) -> std::io::Result<serde_json::Value> {
     let bytes = std::fs::read(marker_path(paths, name))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -1972,6 +2064,7 @@ fn read_marker(paths: &ContainerPaths, name: &str) -> std::io::Result<serde_json
     Ok(value)
 }
 
+#[cfg(feature = "rollout")]
 fn marker_entries_from_json(value: &serde_json::Value) -> std::io::Result<Vec<MarkEntry>> {
     let files = value
         .get("files")
@@ -2000,6 +2093,7 @@ fn marker_entries_from_json(value: &serde_json::Value) -> std::io::Result<Vec<Ma
         .collect()
 }
 
+#[cfg(feature = "rollout")]
 fn marker_entries_from_diff(entries: &[DiffEntry]) -> Vec<MarkEntry> {
     entries
         .iter()
@@ -2013,6 +2107,7 @@ fn marker_entries_from_diff(entries: &[DiffEntry]) -> Vec<MarkEntry> {
         .collect()
 }
 
+#[cfg(feature = "rollout")]
 fn effects_since(marked: &[MarkEntry], current: &[MarkEntry]) -> Vec<EffectEntry> {
     let marked = marker_entry_map(marked);
     let current = marker_entry_map(current);
@@ -2045,6 +2140,7 @@ fn effects_since(marked: &[MarkEntry], current: &[MarkEntry]) -> Vec<EffectEntry
     effects
 }
 
+#[cfg(feature = "rollout")]
 fn marker_entry_map(entries: &[MarkEntry]) -> BTreeMap<String, MarkEntry> {
     entries
         .iter()
@@ -2052,6 +2148,7 @@ fn marker_entry_map(entries: &[MarkEntry]) -> BTreeMap<String, MarkEntry> {
         .collect()
 }
 
+#[cfg(feature = "rollout")]
 fn effects_json(id: &str, since: &str, effects: &[EffectEntry]) -> serde_json::Value {
     let mut changed_files = effects
         .iter()
@@ -2081,6 +2178,7 @@ fn effects_json(id: &str, since: &str, effects: &[EffectEntry]) -> serde_json::V
     })
 }
 
+#[cfg(feature = "rollout")]
 fn file_type_name(meta: &std::fs::Metadata) -> String {
     let ft = meta.file_type();
     if ft.is_dir() {
@@ -2103,6 +2201,7 @@ fn file_type_name(meta: &std::fs::Metadata) -> String {
     .to_string()
 }
 
+#[cfg(feature = "rollout")]
 fn is_overlay_whiteout(path: &Path, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_char_device()
         && libc::major(meta.rdev()) == 0
@@ -2117,6 +2216,7 @@ fn is_overlay_whiteout(path: &Path, meta: &std::fs::Metadata) -> bool {
             .unwrap_or(false)
 }
 
+#[cfg(feature = "rollout")]
 fn is_overlay_opaque_dir(path: &Path) -> bool {
     matches!(
         lgetxattr_value(path, "trusted.overlay.opaque").as_deref(),
@@ -2124,6 +2224,7 @@ fn is_overlay_opaque_dir(path: &Path) -> bool {
     )
 }
 
+#[cfg(feature = "rollout")]
 fn lgetxattr_value(path: &Path, name: &str) -> Option<Vec<u8>> {
     let path_c = CString::new(path.as_os_str().as_bytes()).ok()?;
     let name_c = CString::new(name).ok()?;
@@ -2147,6 +2248,7 @@ fn lgetxattr_value(path: &Path, name: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+#[cfg(feature = "rollout")]
 fn is_sensitive_path(path: &str) -> bool {
     let p = path.trim_start_matches('/');
     p == "etc/passwd"
@@ -2162,6 +2264,7 @@ fn is_sensitive_path(path: &str) -> bool {
         || p.contains("credential")
 }
 
+#[cfg(feature = "rollout")]
 fn slash_path(path: &Path) -> String {
     path.components()
         .filter_map(|c| match c {
@@ -2172,6 +2275,7 @@ fn slash_path(path: &Path) -> String {
         .join("/")
 }
 
+#[cfg(feature = "rollout")]
 fn write_overlay_tar<W: Write>(out: &mut W, entries: &[DiffEntry]) -> std::io::Result<()> {
     for entry in entries {
         match entry.kind {
@@ -2200,6 +2304,7 @@ fn write_overlay_tar<W: Write>(out: &mut W, entries: &[DiffEntry]) -> std::io::R
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn tar_whiteout_path(path: &str) -> String {
     match path.rsplit_once('/') {
         Some((dir, name)) => format!("{dir}/.wh.{name}"),
@@ -2207,6 +2312,7 @@ fn tar_whiteout_path(path: &str) -> String {
     }
 }
 
+#[cfg(feature = "rollout")]
 fn write_tar_path<W: Write>(
     out: &mut W,
     name: &str,
@@ -2233,10 +2339,12 @@ fn write_tar_path<W: Write>(
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn write_tar_empty_file<W: Write>(out: &mut W, name: &str, mode: u32) -> std::io::Result<()> {
     write_tar_header(out, name, mode, 0, b'0', None)
 }
 
+#[cfg(feature = "rollout")]
 fn write_tar_header<W: Write>(
     out: &mut W,
     name: &str,
@@ -2266,6 +2374,7 @@ fn write_tar_header<W: Write>(
     out.write_all(&header)
 }
 
+#[cfg(feature = "rollout")]
 fn write_tar_name(header: &mut [u8; 512], name: &str) -> std::io::Result<()> {
     let bytes = name.as_bytes();
     if bytes.len() <= 100 {
@@ -2291,6 +2400,7 @@ fn write_tar_name(header: &mut [u8; 512], name: &str) -> std::io::Result<()> {
     )))
 }
 
+#[cfg(feature = "rollout")]
 fn write_bytes(dst: &mut [u8], src: &[u8]) -> std::io::Result<()> {
     if src.len() > dst.len() {
         return Err(std::io::Error::other("tar header field too long"));
@@ -2299,6 +2409,7 @@ fn write_bytes(dst: &mut [u8], src: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 fn write_octal(dst: &mut [u8], value: u64) {
     for b in dst.iter_mut() {
         *b = 0;
@@ -2311,6 +2422,7 @@ fn write_octal(dst: &mut [u8], value: u64) {
     dst[width - 1] = 0;
 }
 
+#[cfg(feature = "rollout")]
 fn pad_tar<W: Write>(out: &mut W, size: u64) -> std::io::Result<()> {
     let pad = (512 - (size % 512)) % 512;
     if pad > 0 {
@@ -4186,6 +4298,7 @@ pub fn cmd_delete_with_timeout(
     Ok(())
 }
 
+#[cfg(feature = "rollout")]
 pub fn cmd_reset(id: &str, json: bool) -> std::io::Result<()> {
     let paths = ContainerPaths::for_id(id);
     if !paths.root.exists() {
@@ -4492,11 +4605,12 @@ pub fn cmd_exec_full(
     run_exec_process(id, pj, pid_file, detach, console_socket, None)
 }
 
-/// Options for the agent-oriented direct-command exec mode. This is
+/// Options for the rollout-oriented direct-command exec mode. This is
 /// intentionally separate from OCI `exec -p process.json`: engines keep
-/// their existing behavior, while rollout workers get a step primitive
+/// their existing behavior, while rollout controllers get a step primitive
 /// with bounded output, timeout, and machine-readable results.
-pub struct AgentExecOpts {
+#[cfg_attr(not(feature = "rollout"), allow(dead_code))]
+pub struct RolloutExecOpts {
     pub timeout_ms: Option<u64>,
     pub kill_tree: bool,
     pub max_output_bytes: usize,
@@ -4506,7 +4620,8 @@ pub struct AgentExecOpts {
     pub stdin: Option<Vec<u8>>,
 }
 
-pub fn cmd_exec_agent(id: &str, args: &[String], opts: AgentExecOpts) -> std::io::Result<()> {
+#[cfg_attr(not(feature = "rollout"), allow(dead_code))]
+pub fn cmd_exec_rollout(id: &str, args: &[String], opts: RolloutExecOpts) -> std::io::Result<()> {
     if args.is_empty() {
         return Err(std::io::Error::other("exec: missing command"));
     }
@@ -4532,7 +4647,7 @@ fn run_exec_process(
     pid_file: Option<&Path>,
     detach: bool,
     console_socket: Option<&Path>,
-    agent: Option<AgentExecOpts>,
+    agent: Option<RolloutExecOpts>,
 ) -> std::io::Result<()> {
     // CVE-2019-5736 mitigation: prctl(PR_SET_DUMPABLE, 0).
     set_undumpable();
@@ -4655,7 +4770,7 @@ fn run_exec_process(
             let _ = write_cgroup_file(cgroup_fd, "cgroup.procs", pid.to_string().as_bytes());
         }
         if let Some(agent_opts) = agent {
-            let result = wait_agent_exec(
+            let result = wait_rollout_exec(
                 id,
                 pid,
                 cgroup_fd,
@@ -4669,7 +4784,7 @@ fn run_exec_process(
                 unsafe { libc::close(cgroup_fd) };
             }
             let ok = result.exit_code == Some(0) && !result.timeout;
-            emit_agent_exec_result(&result, agent_opts.json)?;
+            emit_rollout_exec_result(&result, agent_opts.json)?;
             return if agent_opts.json || ok {
                 Ok(())
             } else {
@@ -4826,7 +4941,7 @@ impl CapturedStream {
     }
 }
 
-struct AgentExecResult {
+struct RolloutExecResult {
     exit_code: Option<i32>,
     signal: Option<i32>,
     timeout: bool,
@@ -4839,7 +4954,7 @@ struct AgentExecResult {
     oom_killed: bool,
 }
 
-impl AgentExecResult {
+impl RolloutExecResult {
     fn failure_summary(&self) -> String {
         if self.timeout {
             "timeout".to_string()
@@ -4851,7 +4966,7 @@ impl AgentExecResult {
     }
 }
 
-fn wait_agent_exec(
+fn wait_rollout_exec(
     id: &str,
     pid: libc::pid_t,
     cgroup_fd: i32,
@@ -4859,8 +4974,8 @@ fn wait_agent_exec(
     stdout_fd: i32,
     stderr_fd: i32,
     stdin_fd: i32,
-    opts: &AgentExecOpts,
-) -> std::io::Result<AgentExecResult> {
+    opts: &RolloutExecOpts,
+) -> std::io::Result<RolloutExecResult> {
     let start = Instant::now();
     let timeout = opts.timeout_ms.map(Duration::from_millis);
     let stdin = opts.stdin.as_deref().unwrap_or(&[]);
@@ -4971,7 +5086,7 @@ fn wait_agent_exec(
     let oom_killed =
         stats_after.oom_kill > stats_before.oom_kill || stats_after.oom > stats_before.oom;
 
-    Ok(AgentExecResult {
+    Ok(RolloutExecResult {
         exit_code,
         signal,
         timeout: timed_out,
@@ -4985,7 +5100,7 @@ fn wait_agent_exec(
     })
 }
 
-fn emit_agent_exec_result(result: &AgentExecResult, json: bool) -> std::io::Result<()> {
+fn emit_rollout_exec_result(result: &RolloutExecResult, json: bool) -> std::io::Result<()> {
     if json {
         let value = serde_json::json!({
             "exit_code": result.exit_code,
@@ -5490,6 +5605,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn overlay_state_round_trips_paths_and_reset_count() {
         let (root, paths) = temp_state("overlay-state");
         let lower = root.join("lower");
@@ -5512,6 +5628,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn overlay_state_rejects_reset_paths_outside_state_root() {
         let (root, paths) = temp_state("overlay-outside");
         let lower = root.join("lower");
@@ -5536,6 +5653,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn overlay_state_rejects_parent_dir_escape() {
         let (root, paths) = temp_state("overlay-parent-dir");
         let lower = root.join("lower");
@@ -5560,6 +5678,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn scan_overlay_diff_reports_added_and_modified_from_upper_only() {
         let (root, _paths) = temp_state("overlay-diff");
         let lower = root.join("lower");
@@ -5593,6 +5712,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn checkpoint_lower_chain_branches_keep_empty_independent_uppers() {
         let (root, _paths) = temp_state("checkpoint-lower-chain");
         let base = root.join("base");
@@ -5640,6 +5760,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn effects_report_only_changes_since_marker() {
         let (root, _paths) = temp_state("effects-since-marker");
         let lower = root.join("lower");
@@ -5680,6 +5801,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn tar_writer_exports_whiteout_entries() {
         let entry = DiffEntry {
             path: "dir/deleted".to_string(),
@@ -5701,6 +5823,7 @@ mod runtime_tests {
     }
 
     #[test]
+    #[cfg(feature = "rollout")]
     fn rollout_branches_from_same_snapshot_get_independent_random_llm_steps() {
         struct RandLlmMocker {
             state: u64,

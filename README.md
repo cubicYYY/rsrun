@@ -102,6 +102,10 @@ cargo build --release --no-default-features \
 | `sysctl`             | `linux.sysctl` writes                         |
 | `lsm`                | AppArmor / SELinux exec staging               |
 | `systemd-cgroup`     | `--systemd-cgroup` driver via `systemd-run`   |
+| `rollout`            | rollout overlay state, checkpoints, effects   |
+
+Build Docker-runtime-only binaries without `rollout`; the standard
+OCI lifecycle commands do not depend on the rollout command surface.
 
 ## Use
 
@@ -115,7 +119,7 @@ rsrun delete -f myid
 
 State lives at `/run/rsrun/<id>/`. Override with `--root <dir>`.
 
-Overlay-backed state commands are intended for agent and rollout
+Overlay-backed state commands are intended for rollout
 workflows, not Docker's CRIU checkpoint API:
 
 ```sh
