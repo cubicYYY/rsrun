@@ -49,31 +49,29 @@
 //! (the dir is owned by host root). Pre-opening sidesteps the issue and
 //! also saves one open(2) on the hot path.
 //!
-//! Exec model (Docker / OCI `exec`):
+//! Exec model (Docker / OCI `exec`, one fork):
 //!
 //! ```text
-//! host parent                 namespace helper              exec process
+//! runtime parent                                      exec process
 //!   │
+//!   ├─ pre-open Docker host fds (--pid-file, --console-socket)
 //!   ├─ open /proc/<init>/ns/* fds
-//!   ├─ pipe2(pid relay)
-//!   ├─ socketpair(pty relay, if TTY)
-//!   ├─ fork() ─────────────────────►│
-//!   │                               ├─ setns(user/ipc/uts/net/pid/cgroup/mnt)
-//!   │                               ├─ openpty() inside container devpts (TTY)
-//!   │◄── SCM_RIGHTS(pty master) ────┤
-//!   │                               ├─ fork() ───────────────────►│
-//!   │◄── write(exec_pid) ───────────┤                             ├─ setsid/TIOCSCTTY
-//!   ├─ send PTY master to engine    │                             ├─ dup2 stdio
-//!   ├─ write Docker --pid-file      │                             ├─ apply user/caps/LSM
-//!   └─ wait helper or return        └─ wait exec or exit          └─ execve
+//!   ├─ setns(user/ipc/uts/net/pid/cgroup/mnt)
+//!   ├─ openpty() inside container devpts (TTY)
+//!   ├─ fork() ─────────────────────────────────────►│
+//!   ├─ write Docker --pid-file with host pid        ├─ setsid/TIOCSCTTY
+//!   ├─ send PTY master to engine                    ├─ dup2 stdio
+//!   └─ wait child or return                         ├─ apply user/caps/LSM
+//!                                                    └─ execve
 //! ```
 //!
-//! Why exec uses a helper: `setns` into the container mount namespace
-//! would hide Docker/containerd host paths such as `--pid-file` and
-//! `--console-socket`. The host parent therefore stays outside, while a
-//! short-lived helper enters namespaces, forks the real exec process, and
-//! relays the host PID back. TTY exec allocates the PTY after setns so
-//! `/dev/pts/N` resolves inside the container.
+//! Why exec pre-opens host fds: `setns` into the container mount
+//! namespace hides Docker/containerd paths such as `--pid-file` and
+//! `--console-socket`. Keeping those fds open lets the parent enter
+//! namespaces before the mandatory PID-namespace fork, while still
+//! reporting the host pid and returning the PTY master to the engine.
+//! TTY exec allocates the PTY after setns so `/dev/pts/N` resolves inside
+//! the container.
 
 use crate::clone3::{clone3, CloneArgs};
 use crate::plan::CompiledPlan;
@@ -86,7 +84,7 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execve, execvpe, mkfifo, pivot_root, sethostname, Pid};
 use std::ffi::CString;
 use std::io::Write;
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -802,6 +800,7 @@ fn send_fd_to_socket(sock_fd: i32, fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn recv_fd_from_socket(sock_fd: i32) -> std::io::Result<i32> {
     let mut payload = [0u8; 32];
     let mut iov = libc::iovec {
@@ -2981,33 +2980,65 @@ fn run_exec_process(
     };
 
     let terminal = pj.terminal && console_socket.is_some();
-    let mut pty_relay_sock = [-1i32; 2];
-    if terminal
-        && unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-                pty_relay_sock.as_mut_ptr(),
-            )
-        } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
 
     // Open ns fds in a fixed order. PID namespace must be entered before
     // we fork (kernel requirement: setns(NEWPID) only takes effect on the
     // *next* fork in this process).
     let ns_types = ["user", "ipc", "uts", "net", "pid", "cgroup", "mnt"];
-    let mut ns_fds: Vec<i32> = Vec::new();
-    for ns in &ns_types {
+    let mut ns_fds: Vec<(&str, i32)> = Vec::new();
+    for &ns in &ns_types {
         let p = format!("{}/{}", ns_dir, ns);
         let cs = CString::new(p).unwrap();
         let fd = unsafe { libc::open(cs.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd >= 0 {
-            ns_fds.push(fd);
+            ns_fds.push((ns, fd));
         }
     }
+
+    let pid_file_fd = if let Some(pf) = pid_file {
+        let c = CString::new(pf.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::other("exec pid-file path contains NUL"))?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+                0o700,
+            )
+        };
+        if fd < 0 {
+            for (_, fd) in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            if cgroup_fd >= 0 {
+                unsafe { libc::close(cgroup_fd) };
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        fd
+    } else {
+        -1
+    };
+
+    let console_socket_fd = if terminal {
+        let socket = console_socket.expect("terminal requires console socket");
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(stream) => stream.into_raw_fd(),
+            Err(e) => {
+                if pid_file_fd >= 0 {
+                    unsafe { libc::close(pid_file_fd) };
+                }
+                for (_, fd) in ns_fds {
+                    unsafe { libc::close(fd) };
+                }
+                if cgroup_fd >= 0 {
+                    unsafe { libc::close(cgroup_fd) };
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        -1
+    };
 
     let mut stdout_pipe = [-1i32; 2];
     let mut stderr_pipe = [-1i32; 2];
@@ -3015,62 +3046,104 @@ fn run_exec_process(
     if agent.is_some() {
         if unsafe { libc::pipe2(stdout_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0
         {
+            if pid_file_fd >= 0 {
+                unsafe { libc::close(pid_file_fd) };
+            }
+            if console_socket_fd >= 0 {
+                unsafe { libc::close(console_socket_fd) };
+            }
             return Err(std::io::Error::last_os_error());
         }
         if unsafe { libc::pipe2(stderr_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0
         {
             close_pair(stdout_pipe);
+            if pid_file_fd >= 0 {
+                unsafe { libc::close(pid_file_fd) };
+            }
+            if console_socket_fd >= 0 {
+                unsafe { libc::close(console_socket_fd) };
+            }
             return Err(std::io::Error::last_os_error());
         }
         if unsafe { libc::pipe2(stdin_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
             close_pair(stdout_pipe);
             close_pair(stderr_pipe);
+            if pid_file_fd >= 0 {
+                unsafe { libc::close(pid_file_fd) };
+            }
+            if console_socket_fd >= 0 {
+                unsafe { libc::close(console_socket_fd) };
+            }
             return Err(std::io::Error::last_os_error());
         }
     }
 
-    let mut pid_relay_pipe = [-1i32; 2];
-    if unsafe { libc::pipe2(pid_relay_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-        close_pair(pty_relay_sock);
+    for (ns, fd) in &ns_fds {
+        let rc = unsafe { libc::setns(*fd, 0) };
+        if rc != 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            if *ns == "user" && errno == libc::EINVAL {
+                continue;
+            }
+            close_pair(stdout_pipe);
+            close_pair(stderr_pipe);
+            close_pair(stdin_pipe);
+            for (_, fd) in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            if pid_file_fd >= 0 {
+                unsafe { libc::close(pid_file_fd) };
+            }
+            if console_socket_fd >= 0 {
+                unsafe { libc::close(console_socket_fd) };
+            }
+            if cgroup_fd >= 0 {
+                unsafe { libc::close(cgroup_fd) };
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    for (_, fd) in &ns_fds {
+        unsafe { libc::close(*fd) };
+    }
+
+    let mut pty_master_fd = -1i32;
+    let mut pty_slave_fd = -1i32;
+    if terminal {
+        let res = nix::pty::openpty(None, None)?;
+        pty_master_fd = res.master.into_raw_fd();
+        pty_slave_fd = res.slave.into_raw_fd();
+    }
+
+    // Fork once after setns(CLONE_NEWPID). The parent remains in the
+    // original PID namespace, so fork() returns the host pid Docker wants
+    // in --pid-file; the child is born inside the target PID namespace.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        if pty_master_fd >= 0 {
+            unsafe { libc::close(pty_master_fd) };
+        }
+        if pty_slave_fd >= 0 {
+            unsafe { libc::close(pty_slave_fd) };
+        }
         close_pair(stdout_pipe);
         close_pair(stderr_pipe);
         close_pair(stdin_pipe);
-        for fd in ns_fds {
-            unsafe { libc::close(fd) };
+        if pid_file_fd >= 0 {
+            unsafe { libc::close(pid_file_fd) };
+        }
+        if console_socket_fd >= 0 {
+            unsafe { libc::close(console_socket_fd) };
         }
         if cgroup_fd >= 0 {
             unsafe { libc::close(cgroup_fd) };
         }
         return Err(std::io::Error::last_os_error());
     }
-
-    // Fork a namespace-side helper. The rsrun parent must stay in the
-    // host mount namespace so Docker/containerd paths such as --pid-file
-    // and --console-socket remain visible.
-    let helper_pid = unsafe { libc::fork() };
-    if helper_pid < 0 {
-        close_pair(pid_relay_pipe);
-        close_pair(pty_relay_sock);
-        close_pair(stdout_pipe);
-        close_pair(stderr_pipe);
-        close_pair(stdin_pipe);
-        for fd in ns_fds {
-            unsafe { libc::close(fd) };
+    if pid > 0 {
+        if pty_slave_fd >= 0 {
+            unsafe { libc::close(pty_slave_fd) };
         }
-        if cgroup_fd >= 0 {
-            unsafe { libc::close(cgroup_fd) };
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-    if helper_pid > 0 {
-        for fd in ns_fds {
-            unsafe { libc::close(fd) };
-        }
-        unsafe { libc::close(pid_relay_pipe[1]) };
-        if pty_relay_sock[1] >= 0 {
-            unsafe { libc::close(pty_relay_sock[1]) };
-        }
-
         if agent.is_some() {
             unsafe {
                 libc::close(stdout_pipe[1]);
@@ -3078,28 +3151,23 @@ fn run_exec_process(
                 libc::close(stdin_pipe[0]);
             }
         }
-        let pty_master_fd = if terminal {
-            recv_fd_from_socket(pty_relay_sock[0])?
-        } else {
-            -1
-        };
-        if let (Some(socket), true) = (console_socket, pty_master_fd >= 0) {
-            send_pty_master(socket, pty_master_fd)?;
+        if console_socket_fd >= 0 && pty_master_fd >= 0 {
+            send_fd_to_socket(console_socket_fd, pty_master_fd)?;
+            unsafe { libc::close(console_socket_fd) };
             unsafe { libc::close(pty_master_fd) };
         }
-
-        let exec_pid = read_relayed_pid(pid_relay_pipe[0], helper_pid)?;
-        if let Some(pf) = pid_file {
-            std::fs::write(pf, exec_pid.to_string())?;
+        if pid_file_fd >= 0 {
+            write_all_fd(pid_file_fd, pid.to_string().as_bytes())?;
+            unsafe { libc::close(pid_file_fd) };
         }
         if cgroup_fd >= 0 {
-            let _ = write_cgroup_file(cgroup_fd, "cgroup.procs", exec_pid.to_string().as_bytes());
+            let _ = write_cgroup_file(cgroup_fd, "cgroup.procs", pid.to_string().as_bytes());
         }
         if let Some(agent_opts) = agent {
             let result = wait_rollout_exec(
                 id,
-                helper_pid,
-                exec_pid,
+                pid,
+                pid,
                 cgroup_fd,
                 stats_before,
                 stdout_pipe[0],
@@ -3126,10 +3194,9 @@ fn run_exec_process(
         }
         let mut status: i32 = 0;
         if detach {
-            unsafe { libc::waitpid(helper_pid, &mut status, 0) };
             return Ok(());
         }
-        unsafe { libc::waitpid(helper_pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3140,75 +3207,6 @@ fn run_exec_process(
         } else {
             Err(std::io::Error::other(format!("exec: exit {exit_code}")))
         };
-    }
-
-    // Helper path: enter the target namespaces, fork once more so the
-    // real process lands in the target PID namespace, and relay that
-    // host PID back to the parent.
-    let mut pty_slave_fd = -1i32;
-    unsafe {
-        libc::close(pid_relay_pipe[0]);
-        if pty_relay_sock[0] >= 0 {
-            libc::close(pty_relay_sock[0]);
-        }
-        if cgroup_fd >= 0 {
-            libc::close(cgroup_fd);
-        }
-        for fd in &ns_fds {
-            let _ = libc::setns(*fd, 0);
-        }
-        for fd in &ns_fds {
-            libc::close(*fd);
-        }
-
-        if terminal {
-            match nix::pty::openpty(None, None) {
-                Ok(res) => {
-                    use std::os::fd::IntoRawFd;
-                    let pty_master_fd = res.master.into_raw_fd();
-                    pty_slave_fd = res.slave.into_raw_fd();
-                    if send_fd_to_socket(pty_relay_sock[1], pty_master_fd).is_err() {
-                        libc::_exit(127);
-                    }
-                    libc::close(pty_master_fd);
-                    libc::close(pty_relay_sock[1]);
-                }
-                Err(_) => libc::_exit(127),
-            }
-        }
-
-        let exec_pid = libc::fork();
-        if exec_pid < 0 {
-            libc::_exit(127);
-        }
-        if exec_pid > 0 {
-            let bytes = (exec_pid as i32).to_ne_bytes();
-            let _ = libc::write(pid_relay_pipe[1], bytes.as_ptr() as *const _, bytes.len());
-            libc::close(pid_relay_pipe[1]);
-            if agent.is_some() {
-                close_pair(stdout_pipe);
-                close_pair(stderr_pipe);
-                close_pair(stdin_pipe);
-            }
-            if pty_slave_fd >= 0 {
-                libc::close(pty_slave_fd);
-            }
-            if detach {
-                libc::_exit(0);
-            }
-            let mut status = 0i32;
-            if libc::waitpid(exec_pid, &mut status, 0) < 0 {
-                libc::_exit(127);
-            }
-            if libc::WIFEXITED(status) {
-                libc::_exit(libc::WEXITSTATUS(status));
-            }
-            if libc::WIFSIGNALED(status) {
-                libc::_exit(128 + libc::WTERMSIG(status));
-            }
-            libc::_exit(127);
-        }
-        libc::close(pid_relay_pipe[1]);
     }
 
     // Child path. Apply OCI process fields in the same order as create's
@@ -3617,31 +3615,26 @@ fn close_pair(pair: [i32; 2]) {
     }
 }
 
-fn read_relayed_pid(fd: i32, helper_pid: libc::pid_t) -> std::io::Result<libc::pid_t> {
-    let mut buf = [0u8; 4];
-    let mut got = 0usize;
-    while got < buf.len() {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().add(got) as *mut _, buf.len() - got) };
+fn write_all_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
         if n > 0 {
-            got += n as usize;
+            data = &data[n as usize..];
             continue;
         }
-        unsafe { libc::close(fd) };
-        let mut status = 0i32;
-        unsafe { libc::waitpid(helper_pid, &mut status, 0) };
         if n == 0 {
-            return Err(std::io::Error::other(
-                "exec helper exited before reporting process pid",
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write returned 0",
             ));
         }
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
     }
-    unsafe { libc::close(fd) };
-    let pid = i32::from_ne_bytes(buf);
-    if pid <= 0 {
-        return Err(std::io::Error::other("exec helper reported invalid pid"));
-    }
-    Ok(pid)
+    Ok(())
 }
 
 unsafe fn clear_nonblock(fd: i32) {
