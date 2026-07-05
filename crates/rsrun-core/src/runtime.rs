@@ -205,6 +205,8 @@ pub fn cmd_create_full_with_timeout(
     plan.console_socket = console_socket.map(|p| p.to_path_buf());
     plan.no_pivot = opts.no_pivot;
 
+    close_unpreserved_inherited_fds(opts.preserve_fds);
+
     // Pre-build all CStrings the child needs. Allocator is forbidden after clone3.
     let rootfs_cstr =
         CString::new(plan.root_path.as_os_str().as_encoded_bytes()).map_err(|_| {
@@ -963,6 +965,34 @@ unsafe fn child_die(err_fd: i32, code: i32, reason: &[u8]) -> ! {
     libc::_exit(code);
 }
 
+fn close_unpreserved_inherited_fds(preserve_fds: u32) {
+    let first = 3u32.saturating_add(preserve_fds);
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, first, u32::MAX, 0) == 0 {
+            return;
+        }
+        let errno = *libc::__errno_location();
+        if errno != libc::ENOSYS {
+            return;
+        }
+        let max = libc::sysconf(libc::_SC_OPEN_MAX);
+        if max <= first as libc::c_long {
+            return;
+        }
+        for fd in first..(max as u32) {
+            let _ = libc::close(fd as i32);
+        }
+    }
+}
+
+unsafe fn close_create_stdio_before_tty_wait(fifo_fd: i32, err_fd: i32, pty_slave_fd: i32) {
+    for fd in 0..=2 {
+        if fd != fifo_fd && fd != err_fd && fd != pty_slave_fd {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Child code path. Runs in the new namespaces. Must not allocate, must
 /// not panic. Ends with `execve` or `_exit(non-zero)`.
 ///
@@ -1335,6 +1365,14 @@ unsafe fn child_run(
     // 7. Chdir to spec.cwd inside the container.
     let cwd_str = plan.cwd.to_str().unwrap_or("/");
     let _ = chdir(cwd_str);
+
+    // In terminal mode, stdio for the workload comes from the PTY slave
+    // after `start`. Do not keep the create command's stdout/stderr pipes
+    // open while parked on the FIFO; containerd waits for those create-side
+    // fds to drain before it issues `start`.
+    if plan.terminal && pty_slave_fd >= 0 {
+        close_create_stdio_before_tty_wait(fifo_fd, err_fd, pty_slave_fd);
+    }
 
     // 8. Block on the FIFO until `start` writes. We use ppoll(POLLIN) which
     // waits for a real writer to send data (with NONBLOCK fd, plain read()
@@ -3695,6 +3733,98 @@ pub fn cmd_list() -> std::io::Result<()> {
 mod runtime_tests {
     use super::*;
 
+    fn assert_fd_child_ok(child: unsafe fn(i32) -> !) {
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+
+        if pid == 0 {
+            unsafe {
+                libc::close(pipe[0]);
+                if pipe[1] != 3 {
+                    libc::dup2(pipe[1], 3);
+                    libc::close(pipe[1]);
+                }
+                child(3);
+            }
+        }
+
+        unsafe { libc::close(pipe[1]) };
+        let mut byte = [0u8; 1];
+        let n = unsafe { libc::read(pipe[0], byte.as_mut_ptr() as *mut _, 1) };
+        unsafe { libc::close(pipe[0]) };
+
+        let mut status = 0i32;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(n, 1);
+        assert_eq!(byte[0], b'1');
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    unsafe fn report_fd_child_result(report_fd: i32, ok: bool) -> ! {
+        let byte = if ok { b'1' } else { b'0' };
+        let _ = libc::write(report_fd, &byte as *const u8 as *const _, 1);
+        libc::_exit(if ok { 0 } else { 1 });
+    }
+
+    unsafe fn fd_is_open(fd: i32) -> bool {
+        libc::fcntl(fd, libc::F_GETFD) >= 0
+    }
+
+    unsafe fn fd_is_closed(fd: i32) -> bool {
+        libc::fcntl(fd, libc::F_GETFD) < 0 && *libc::__errno_location() == libc::EBADF
+    }
+
+    unsafe fn open_dev_null_at(fd: i32) -> bool {
+        let opened = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY);
+        if opened < 0 {
+            return false;
+        }
+        let ok = opened == fd || libc::dup2(opened, fd) == fd;
+        if opened != fd {
+            libc::close(opened);
+        }
+        ok
+    }
+
+    unsafe fn child_assert_unpreserved_fds_are_closed(report_fd: i32) -> ! {
+        if !open_dev_null_at(4) {
+            report_fd_child_result(report_fd, false);
+        }
+
+        close_unpreserved_inherited_fds(1);
+
+        report_fd_child_result(report_fd, fd_is_open(report_fd) && fd_is_closed(4));
+    }
+
+    unsafe fn child_assert_tty_wait_closes_create_stdio_only(report_fd: i32) -> ! {
+        for fd in 0..=2 {
+            if !open_dev_null_at(fd) {
+                report_fd_child_result(report_fd, false);
+            }
+        }
+        for fd in 4..=6 {
+            if !open_dev_null_at(fd) {
+                report_fd_child_result(report_fd, false);
+            }
+        }
+
+        close_create_stdio_before_tty_wait(4, 5, 6);
+
+        let stdio_closed = fd_is_closed(0) && fd_is_closed(1) && fd_is_closed(2);
+        let internal_open = fd_is_open(4) && fd_is_open(5) && fd_is_open(6);
+        report_fd_child_result(
+            report_fd,
+            stdio_closed && internal_open && fd_is_open(report_fd),
+        );
+    }
+
     fn temp_state(name: &str) -> (PathBuf, ContainerPaths) {
         let root = std::env::temp_dir().join(format!(
             "rsrun-{name}-test-{}-{}",
@@ -3729,6 +3859,16 @@ mod runtime_tests {
             Some("delete exceeded timeout")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closes_unpreserved_inherited_fds_before_create() {
+        assert_fd_child_ok(child_assert_unpreserved_fds_are_closed);
+    }
+
+    #[test]
+    fn tty_wait_releases_create_stdio_without_closing_internal_fds() {
+        assert_fd_child_ok(child_assert_tty_wait_closes_create_stdio_only);
     }
 
     #[test]
