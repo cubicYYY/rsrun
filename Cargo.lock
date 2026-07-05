@@ -183,7 +183,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsrun"
+name = "rsrun-cli"
 version = "0.1.0"
 dependencies = [
  "clap",

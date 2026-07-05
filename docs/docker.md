@@ -34,7 +34,7 @@ rsrun --root <state-dir> \
       create --bundle <bundle-dir> --pid-file <pid-file> <id>
 ```
 
-rsrun handles this layer in `crates/rsrun/src/main.rs`:
+rsrun handles this layer in `crates/rsrun-cli/src/main.rs`:
 
 - `--root` overrides the state directory.
 - `--log` redirects stderr to a file so containerd can recover the

@@ -94,10 +94,13 @@ The OCI lifecycle commands (`create`, `start`, `state`, `kill`,
 `delete`, `exec -p`, `pause`, `resume`, `update`, `stats`, `events`)
 must continue to compile and run without it.
 
-Before adding packed layers, move the internal rollout filesystem
-helper implementation out of `runtime.rs` into a dedicated implementation
-module or crate. The feature flag should stay coarse; avoid spreading
-per-function cfg logic through the lifecycle hot path.
+✅ Rollout filesystem/checkpoint implementation lives in
+`rsrun_core::rollout`. `runtime.rs` only calls small rollout hooks
+needed by `create`/`delete`; state operations (`reset`, `diff`,
+`export-diff`, `snapshot`, `checkpoint`, `fork-checkpoint`, `mark`,
+`effects`) stay behind the rollout module boundary. Keep the feature
+flag coarse and avoid spreading per-function cfg logic through the
+lifecycle hot path.
 
 ## Production-readiness — what's still missing
 

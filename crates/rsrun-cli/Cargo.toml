@@ -1,5 +1,5 @@
 [package]
-name = "rsrun"
+name = "rsrun-cli"
 description = "A small OCI runtime in Rust."
 version.workspace = true
 edition.workspace = true

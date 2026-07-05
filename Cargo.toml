@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rsrun-core", "crates/rsrun-ext", "crates/rsrun"]
+members = ["crates/rsrun-core", "crates/rsrun-ext", "crates/rsrun-cli"]
 
 [workspace.package]
 version = "0.1.0"
