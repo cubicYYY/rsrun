@@ -48,6 +48,32 @@
 //! mapped uid can't traverse /run/rsrun/<id>/ to open the FIFO itself
 //! (the dir is owned by host root). Pre-opening sidesteps the issue and
 //! also saves one open(2) on the hot path.
+//!
+//! Exec model (Docker / OCI `exec`):
+//!
+//! ```text
+//! host parent                 namespace helper              exec process
+//!   │
+//!   ├─ open /proc/<init>/ns/* fds
+//!   ├─ pipe2(pid relay)
+//!   ├─ socketpair(pty relay, if TTY)
+//!   ├─ fork() ─────────────────────►│
+//!   │                               ├─ setns(user/ipc/uts/net/pid/cgroup/mnt)
+//!   │                               ├─ openpty() inside container devpts (TTY)
+//!   │◄── SCM_RIGHTS(pty master) ────┤
+//!   │                               ├─ fork() ───────────────────►│
+//!   │◄── write(exec_pid) ───────────┤                             ├─ setsid/TIOCSCTTY
+//!   ├─ send PTY master to engine    │                             ├─ dup2 stdio
+//!   ├─ write Docker --pid-file      │                             ├─ apply user/caps/LSM
+//!   └─ wait helper or return        └─ wait exec or exit          └─ execve
+//! ```
+//!
+//! Why exec uses a helper: `setns` into the container mount namespace
+//! would hide Docker/containerd host paths such as `--pid-file` and
+//! `--console-socket`. The host parent therefore stays outside, while a
+//! short-lived helper enters namespaces, forks the real exec process, and
+//! relays the host PID back. TTY exec allocates the PTY after setns so
+//! `/dev/pts/N` resolves inside the container.
 
 use crate::clone3::{clone3, CloneArgs};
 use crate::plan::CompiledPlan;
@@ -739,8 +765,10 @@ fn send_pty_master(socket_path: &Path, master_fd: i32) -> std::io::Result<()> {
     use std::os::unix::net::UnixStream;
 
     let stream = UnixStream::connect(socket_path)?;
-    let sock_fd = stream.as_raw_fd();
+    send_fd_to_socket(stream.as_raw_fd(), master_fd)
+}
 
+fn send_fd_to_socket(sock_fd: i32, fd: i32) -> std::io::Result<()> {
     let payload: &[u8] = b"/dev/ptmx";
     let iov = libc::iovec {
         iov_base: payload.as_ptr() as *mut _,
@@ -764,7 +792,7 @@ fn send_pty_master(socket_path: &Path, master_fd: i32) -> std::io::Result<()> {
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
         let data = libc::CMSG_DATA(cmsg) as *mut i32;
-        std::ptr::write_unaligned(data, master_fd);
+        std::ptr::write_unaligned(data, fd);
 
         let n = libc::sendmsg(sock_fd, &msg, 0);
         if n < 0 {
@@ -772,6 +800,44 @@ fn send_pty_master(socket_path: &Path, master_fd: i32) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn recv_fd_from_socket(sock_fd: i32) -> std::io::Result<i32> {
+    let mut payload = [0u8; 32];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr() as *mut _,
+        iov_len: payload.len(),
+    };
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov as *mut _;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
+    msg.msg_controllen = cmsg_buf.len();
+
+    let n = unsafe { libc::recvmsg(sock_fd, &mut msg, 0) };
+    unsafe { libc::close(sock_fd) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null()
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(std::io::Error::other("missing SCM_RIGHTS fd"));
+        }
+        let data = libc::CMSG_DATA(cmsg) as *const i32;
+        let fd = std::ptr::read_unaligned(data);
+        if fd < 0 {
+            return Err(std::io::Error::other("received invalid fd"));
+        }
+        Ok(fd)
+    }
 }
 
 /// Fork+exec each hook command in sequence. Failures are logged but
@@ -2827,7 +2893,10 @@ pub fn cmd_exec_full(
     detach: bool,
     console_socket: Option<&Path>,
 ) -> std::io::Result<()> {
-    let pj = parse_exec_process(process_json)?;
+    let mut pj = parse_exec_process(process_json)?;
+    if console_socket.is_some() {
+        pj.terminal = true;
+    }
     run_exec_process(id, pj, pid_file, detach, console_socket, None)
 }
 
@@ -2911,15 +2980,19 @@ fn run_exec_process(
         CgroupSample::default()
     };
 
-    // PTY allocation, when the spec sets terminal:true AND the engine
-    // gave us a console socket. Both fds stay -1 otherwise.
-    let mut pty_master_fd: i32 = -1;
-    let mut pty_slave_fd: i32 = -1;
-    if pj.terminal && console_socket.is_some() {
-        let res = nix::pty::openpty(None, None)?;
-        use std::os::fd::IntoRawFd;
-        pty_master_fd = res.master.into_raw_fd();
-        pty_slave_fd = res.slave.into_raw_fd();
+    let terminal = pj.terminal && console_socket.is_some();
+    let mut pty_relay_sock = [-1i32; 2];
+    if terminal
+        && unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                pty_relay_sock.as_mut_ptr(),
+            )
+        } < 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
 
     // Open ns fds in a fixed order. PID namespace must be entered before
@@ -2934,12 +3007,6 @@ fn run_exec_process(
         if fd >= 0 {
             ns_fds.push(fd);
         }
-    }
-    for fd in &ns_fds {
-        let _ = unsafe { libc::setns(*fd, 0) };
-    }
-    for fd in &ns_fds {
-        unsafe { libc::close(*fd) };
     }
 
     let mut stdout_pipe = [-1i32; 2];
@@ -2962,22 +3029,48 @@ fn run_exec_process(
         }
     }
 
-    // Fork to enter the PID namespace.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
+    let mut pid_relay_pipe = [-1i32; 2];
+    if unsafe { libc::pipe2(pid_relay_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        close_pair(pty_relay_sock);
         close_pair(stdout_pipe);
         close_pair(stderr_pipe);
         close_pair(stdin_pipe);
+        for fd in ns_fds {
+            unsafe { libc::close(fd) };
+        }
         if cgroup_fd >= 0 {
             unsafe { libc::close(cgroup_fd) };
         }
         return Err(std::io::Error::last_os_error());
     }
-    if pid > 0 {
-        // Parent: hand the PTY master to the engine, close the slave.
-        if pty_slave_fd >= 0 {
-            unsafe { libc::close(pty_slave_fd) };
+
+    // Fork a namespace-side helper. The rsrun parent must stay in the
+    // host mount namespace so Docker/containerd paths such as --pid-file
+    // and --console-socket remain visible.
+    let helper_pid = unsafe { libc::fork() };
+    if helper_pid < 0 {
+        close_pair(pid_relay_pipe);
+        close_pair(pty_relay_sock);
+        close_pair(stdout_pipe);
+        close_pair(stderr_pipe);
+        close_pair(stdin_pipe);
+        for fd in ns_fds {
+            unsafe { libc::close(fd) };
         }
+        if cgroup_fd >= 0 {
+            unsafe { libc::close(cgroup_fd) };
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    if helper_pid > 0 {
+        for fd in ns_fds {
+            unsafe { libc::close(fd) };
+        }
+        unsafe { libc::close(pid_relay_pipe[1]) };
+        if pty_relay_sock[1] >= 0 {
+            unsafe { libc::close(pty_relay_sock[1]) };
+        }
+
         if agent.is_some() {
             unsafe {
                 libc::close(stdout_pipe[1]);
@@ -2985,20 +3078,28 @@ fn run_exec_process(
                 libc::close(stdin_pipe[0]);
             }
         }
+        let pty_master_fd = if terminal {
+            recv_fd_from_socket(pty_relay_sock[0])?
+        } else {
+            -1
+        };
         if let (Some(socket), true) = (console_socket, pty_master_fd >= 0) {
             send_pty_master(socket, pty_master_fd)?;
             unsafe { libc::close(pty_master_fd) };
         }
+
+        let exec_pid = read_relayed_pid(pid_relay_pipe[0], helper_pid)?;
         if let Some(pf) = pid_file {
-            std::fs::write(pf, pid.to_string())?;
+            std::fs::write(pf, exec_pid.to_string())?;
         }
         if cgroup_fd >= 0 {
-            let _ = write_cgroup_file(cgroup_fd, "cgroup.procs", pid.to_string().as_bytes());
+            let _ = write_cgroup_file(cgroup_fd, "cgroup.procs", exec_pid.to_string().as_bytes());
         }
         if let Some(agent_opts) = agent {
             let result = wait_rollout_exec(
                 id,
-                pid,
+                helper_pid,
+                exec_pid,
                 cgroup_fd,
                 stats_before,
                 stdout_pipe[0],
@@ -3023,11 +3124,12 @@ fn run_exec_process(
         if cgroup_fd >= 0 {
             unsafe { libc::close(cgroup_fd) };
         }
+        let mut status: i32 = 0;
         if detach {
+            unsafe { libc::waitpid(helper_pid, &mut status, 0) };
             return Ok(());
         }
-        let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(helper_pid, &mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3038,6 +3140,75 @@ fn run_exec_process(
         } else {
             Err(std::io::Error::other(format!("exec: exit {exit_code}")))
         };
+    }
+
+    // Helper path: enter the target namespaces, fork once more so the
+    // real process lands in the target PID namespace, and relay that
+    // host PID back to the parent.
+    let mut pty_slave_fd = -1i32;
+    unsafe {
+        libc::close(pid_relay_pipe[0]);
+        if pty_relay_sock[0] >= 0 {
+            libc::close(pty_relay_sock[0]);
+        }
+        if cgroup_fd >= 0 {
+            libc::close(cgroup_fd);
+        }
+        for fd in &ns_fds {
+            let _ = libc::setns(*fd, 0);
+        }
+        for fd in &ns_fds {
+            libc::close(*fd);
+        }
+
+        if terminal {
+            match nix::pty::openpty(None, None) {
+                Ok(res) => {
+                    use std::os::fd::IntoRawFd;
+                    let pty_master_fd = res.master.into_raw_fd();
+                    pty_slave_fd = res.slave.into_raw_fd();
+                    if send_fd_to_socket(pty_relay_sock[1], pty_master_fd).is_err() {
+                        libc::_exit(127);
+                    }
+                    libc::close(pty_master_fd);
+                    libc::close(pty_relay_sock[1]);
+                }
+                Err(_) => libc::_exit(127),
+            }
+        }
+
+        let exec_pid = libc::fork();
+        if exec_pid < 0 {
+            libc::_exit(127);
+        }
+        if exec_pid > 0 {
+            let bytes = (exec_pid as i32).to_ne_bytes();
+            let _ = libc::write(pid_relay_pipe[1], bytes.as_ptr() as *const _, bytes.len());
+            libc::close(pid_relay_pipe[1]);
+            if agent.is_some() {
+                close_pair(stdout_pipe);
+                close_pair(stderr_pipe);
+                close_pair(stdin_pipe);
+            }
+            if pty_slave_fd >= 0 {
+                libc::close(pty_slave_fd);
+            }
+            if detach {
+                libc::_exit(0);
+            }
+            let mut status = 0i32;
+            if libc::waitpid(exec_pid, &mut status, 0) < 0 {
+                libc::_exit(127);
+            }
+            if libc::WIFEXITED(status) {
+                libc::_exit(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                libc::_exit(128 + libc::WTERMSIG(status));
+            }
+            libc::_exit(127);
+        }
+        libc::close(pid_relay_pipe[1]);
     }
 
     // Child path. Apply OCI process fields in the same order as create's
@@ -3065,11 +3236,9 @@ fn run_exec_process(
         if cgroup_fd >= 0 {
             libc::close(cgroup_fd);
         }
-        // Close the parent's master end (we kept it for sending). Slave
-        // becomes our controlling terminal + stdio.
-        if pty_master_fd >= 0 {
-            libc::close(pty_master_fd);
-        }
+        // The helper allocated the PTY after entering the container mount
+        // namespace and sent the master fd to the host-side parent. The exec
+        // child keeps only the slave, which becomes its controlling terminal.
         if pty_slave_fd >= 0 {
             if libc::setsid() < 0 {
                 libc::_exit(116);
@@ -3194,7 +3363,8 @@ impl RolloutExecResult {
 
 fn wait_rollout_exec(
     id: &str,
-    pid: libc::pid_t,
+    wait_pid: libc::pid_t,
+    signal_pid: libc::pid_t,
     cgroup_fd: i32,
     stats_before: CgroupSample,
     stdout_fd: i32,
@@ -3234,8 +3404,8 @@ fn wait_rollout_exec(
 
         if status.is_none() {
             let mut st = 0i32;
-            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
-            if r == pid {
+            let r = unsafe { libc::waitpid(wait_pid, &mut st, libc::WNOHANG) };
+            if r == wait_pid {
                 status = Some(st);
             } else if r < 0 {
                 let e = std::io::Error::last_os_error();
@@ -3254,7 +3424,7 @@ fn wait_rollout_exec(
                 if !timed_out && start.elapsed() >= limit {
                     timed_out = true;
                     term_sent_at = Some(Instant::now());
-                    kill_exec_tree(id, pid, cgroup_fd, opts.kill_tree, libc::SIGTERM);
+                    kill_exec_tree(id, signal_pid, cgroup_fd, opts.kill_tree, libc::SIGTERM);
                 }
                 if timed_out
                     && !kill_sent
@@ -3263,7 +3433,7 @@ fn wait_rollout_exec(
                         .unwrap_or(false)
                 {
                     kill_sent = true;
-                    kill_exec_tree(id, pid, cgroup_fd, opts.kill_tree, libc::SIGKILL);
+                    kill_exec_tree(id, signal_pid, cgroup_fd, opts.kill_tree, libc::SIGKILL);
                 }
             }
         }
@@ -3445,6 +3615,33 @@ fn close_pair(pair: [i32; 2]) {
             unsafe { libc::close(fd) };
         }
     }
+}
+
+fn read_relayed_pid(fd: i32, helper_pid: libc::pid_t) -> std::io::Result<libc::pid_t> {
+    let mut buf = [0u8; 4];
+    let mut got = 0usize;
+    while got < buf.len() {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().add(got) as *mut _, buf.len() - got) };
+        if n > 0 {
+            got += n as usize;
+            continue;
+        }
+        unsafe { libc::close(fd) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(helper_pid, &mut status, 0) };
+        if n == 0 {
+            return Err(std::io::Error::other(
+                "exec helper exited before reporting process pid",
+            ));
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { libc::close(fd) };
+    let pid = i32::from_ne_bytes(buf);
+    if pid <= 0 {
+        return Err(std::io::Error::other("exec helper reported invalid pid"));
+    }
+    Ok(pid)
 }
 
 unsafe fn clear_nonblock(fd: i32) {
@@ -3823,6 +4020,34 @@ mod runtime_tests {
             report_fd,
             stdio_closed && internal_open && fd_is_open(report_fd),
         );
+    }
+
+    #[test]
+    fn unix_socket_fd_relay_round_trips_fd() {
+        let mut socks = [-1i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    socks.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY) };
+        assert!(fd >= 0);
+
+        send_fd_to_socket(socks[0], fd).unwrap();
+        unsafe {
+            libc::close(socks[0]);
+            libc::close(fd);
+        }
+
+        let received = recv_fd_from_socket(socks[1]).unwrap();
+        assert!(unsafe { fd_is_open(received) });
+        unsafe { libc::close(received) };
     }
 
     fn temp_state(name: &str) -> (PathBuf, ContainerPaths) {
