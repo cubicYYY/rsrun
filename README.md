@@ -139,6 +139,11 @@ rsrun effects branch1 --since step_10 --json
 container. Pass `--bundle` when the checkpoint artifact was imported on
 a host where the original bundle path is not valid.
 
+For high-fanout rollout, keep branches stopped until they need CPU or
+memory, activate only the branches that are about to run a step, then
+delete or checkpoint them according to the controller's retention
+policy.
+
 As a Docker runtime:
 
 ```jsonc

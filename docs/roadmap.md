@@ -252,6 +252,25 @@ export/import checkpoints, how many branches to fan out, and when to
 delete or retain activated branches. The rsrun-level portable layer use
 path is now available.
 
+Branch lifecycle is the next controller concern. The controller should
+distinguish at least these states:
+
+- **Prepared**: a stopped branch produced by `fork-checkpoint`; it has
+  overlay state but no live init process.
+- **Active**: `activate` + `start` completed, so rollout steps can run
+  through `exec --json -- <step>`.
+- **Committed**: a useful branch was saved as a new checkpoint for later
+  fanout or transfer.
+- **Disposed**: a losing or expired branch was removed with
+  `delete -f`.
+
+This matters because massive rollout may create many more candidate
+branches than can run at once. Keeping idle candidates as stopped
+filesystem states avoids paying process, namespace, cgroup, and memory
+cost until a branch is scheduled. After a step, the controller can keep
+the branch active for the next step, checkpoint it as a new breakpoint,
+or delete it immediately.
+
 Proposed commands:
 
 ```text

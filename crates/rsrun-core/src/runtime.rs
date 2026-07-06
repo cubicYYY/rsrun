@@ -314,7 +314,7 @@ fn spawn_container_init(
             e
         })?;
     }
-    let mut plan = CompiledPlan::from_spec(&spec).map_err(|e| {
+    let mut plan = CompiledPlan::from_spec(spec).map_err(|e| {
         cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
         e
     })?;
@@ -677,7 +677,7 @@ fn spawn_container_init(
     if let Some(pf) = pid_file {
         std::fs::write(pf, init_pid.to_string())?;
     }
-    write_state(&paths, id, init_pid, &bundle, "creating", comm_hint)?;
+    write_state(paths, id, init_pid, bundle, "creating", comm_hint)?;
 
     // Anything below here that errors must not leak the init. The
     // `?`-using sites (apply_scheduler, hooks persist) call into
@@ -697,7 +697,7 @@ fn spawn_container_init(
         }
         // Final transition: "creating" → "created". `start` will move
         // it on to "running".
-        write_state(&paths, id, init_pid, &bundle, "created", comm_hint)?;
+        write_state(paths, id, init_pid, bundle, "created", comm_hint)?;
         Ok(())
     })();
 

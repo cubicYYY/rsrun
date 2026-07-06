@@ -1047,6 +1047,11 @@ fn write_all_raw_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(feature = "rollout")]
+    use std::sync::Mutex;
+
+    #[cfg(feature = "rollout")]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_duration_suffixes() {
@@ -1097,10 +1102,57 @@ mod tests {
             #[cfg(feature = "rollout")]
             command: Vec::new(),
         }));
+        #[cfg(feature = "rollout")]
+        assert!(command_needs_sealed_reexec(&Cmd::Activate {
+            bundle: None,
+            json: false,
+            timeout: None,
+            id: "id".into(),
+        }));
         assert!(!command_needs_sealed_reexec(&Cmd::State {
             id: "id".into()
         }));
         assert!(!command_needs_sealed_reexec(&Cmd::Features));
+    }
+
+    #[cfg(feature = "rollout")]
+    #[test]
+    fn stored_bundle_for_container_reads_state_bundle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "rsrun-cli-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let old_root = std::env::var_os("RSRUN_ROOT");
+        std::env::set_var("RSRUN_ROOT", &root);
+        let paths = rsrun_core::state::ContainerPaths::for_id("branch1");
+        paths.ensure().unwrap();
+        std::fs::write(
+            paths.state_file(),
+            serde_json::to_vec(&json!({
+                "id": "branch1",
+                "status": "stopped",
+                "pid": 0,
+                "bundle": "/tmp/local-bundle"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored_bundle_for_container("branch1").unwrap(),
+            PathBuf::from("/tmp/local-bundle")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match old_root {
+            Some(value) => std::env::set_var("RSRUN_ROOT", value),
+            None => std::env::remove_var("RSRUN_ROOT"),
+        }
     }
 
     #[cfg(target_os = "linux")]

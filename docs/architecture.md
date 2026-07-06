@@ -111,6 +111,13 @@ artifacts are follow-up storage formats, not hot-path requirements.
 a created container using the prepared overlay rootfs from state and the
 OCI process/mount configuration from the local bundle. After `start`,
 rollout controllers can use `exec --json -- <step>` against that branch.
+
+Branch lifecycle is intentionally controller-owned. A branch can stay as
+a stopped overlay state while it waits in a rollout queue, become active
+only while a model/tool step is running, then be deleted, checkpointed,
+or kept warm depending on score and retry policy. This avoids paying
+process, cgroup, namespace, and memory cost for every possible branch at
+once while still keeping filesystem forks cheap.
 `mark` persists a named overlay-diff baseline;
 `effects --since <marker> --json` compares the current diff against
 that baseline and emits changed paths, sensitive touches, and
