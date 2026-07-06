@@ -5,6 +5,10 @@ use rsrun_core as runtime;
 use clap::{Parser, Subcommand};
 #[cfg(feature = "rollout")]
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -266,6 +270,13 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if command_needs_sealed_reexec(&cli.cmd) {
+        if let Err(e) = reexec_from_sealed_memfd() {
+            eprintln!("rsrun: CVE-2019-5736 mitigation failed: {e}");
+            return ExitCode::from(1);
+        }
+    }
 
     if let Some(p) = &cli.root {
         std::env::set_var("RSRUN_ROOT", p);
@@ -785,6 +796,169 @@ fn create_with_ext(
     )
 }
 
+fn command_needs_sealed_reexec(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Create { .. } | Cmd::Exec { .. })
+}
+
+#[cfg(target_os = "linux")]
+fn reexec_from_sealed_memfd() -> std::io::Result<()> {
+    const MARKER: &str = "RSRUN_MEMFD_REEXEC";
+    if std::env::var_os(MARKER).is_some() {
+        return Ok(());
+    }
+
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"rsrun".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        ) as i32
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if let Err(e) = copy_self_exe_to_memfd(fd) {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+
+    let mut argv = Vec::new();
+    for arg in std::env::args_os() {
+        argv.push(
+            std::ffi::CString::new(arg.as_os_str().as_bytes()).map_err(|_| {
+                unsafe { libc::close(fd) };
+                std::io::Error::other("argv contains NUL")
+            })?,
+        );
+    }
+    let mut envp = Vec::new();
+    envp.push(std::ffi::CString::new(format!("{MARKER}=1")).unwrap());
+    for (key, value) in std::env::vars_os() {
+        let mut item = Vec::new();
+        item.extend_from_slice(key.as_os_str().as_bytes());
+        item.push(b'=');
+        item.extend_from_slice(value.as_os_str().as_bytes());
+        envp.push(std::ffi::CString::new(item).map_err(|_| {
+            unsafe { libc::close(fd) };
+            std::io::Error::other("environment contains NUL")
+        })?);
+    }
+
+    let argv_ptrs: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let envp_ptrs: Vec<*const libc::c_char> = envp
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
+    unsafe {
+        libc::fexecve(fd, argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+    }
+    let e = std::io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    Err(e)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reexec_from_sealed_memfd() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_self_exe_to_memfd(memfd: i32) -> std::io::Result<()> {
+    let mut exe = std::fs::File::open("/proc/self/exe")?;
+    let len = exe.metadata()?.len();
+    let mut offset: libc::off_t = 0;
+
+    while (offset as u64) < len {
+        let remaining = (len - offset as u64).min(usize::MAX as u64) as usize;
+        let n = unsafe { libc::sendfile(memfd, exe.as_raw_fd(), &mut offset, remaining) };
+        if n > 0 {
+            continue;
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sendfile copied a partial executable",
+            ));
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.raw_os_error() == Some(libc::EINVAL) || err.raw_os_error() == Some(libc::ENOSYS) {
+            return copy_self_exe_to_memfd_buffered(memfd, &mut exe);
+        }
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_self_exe_to_memfd_buffered(memfd: i32, exe: &mut std::fs::File) -> std::io::Result<()> {
+    if unsafe { libc::lseek(exe.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::ftruncate(memfd, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::lseek(memfd, 0, libc::SEEK_SET) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut buf = [0u8; 128 * 1024];
+    loop {
+        let n = std::io::Read::read(exe, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        write_all_raw_fd(memfd, &buf[..n])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_raw_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+        if n > 0 {
+            data = &data[n as usize..];
+            continue;
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write returned 0",
+            ));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +971,79 @@ mod tests {
         assert_eq!(parse_duration_ms("3m").unwrap(), 180_000);
         assert_eq!(parse_duration_ms("4").unwrap(), 4_000);
         assert!(parse_duration_ms("abc").is_err());
+    }
+
+    #[test]
+    fn sealed_reexec_only_wraps_container_entry_paths() {
+        assert!(command_needs_sealed_reexec(&Cmd::Create {
+            bundle: PathBuf::from("."),
+            pid_file: None,
+            console_socket: None,
+            preserve_fds: None,
+            no_pivot: false,
+            timeout: None,
+            id: "id".into(),
+        }));
+        assert!(command_needs_sealed_reexec(&Cmd::Exec {
+            process: None,
+            pid_file: None,
+            detach: false,
+            #[cfg(feature = "rollout")]
+            timeout: None,
+            #[cfg(feature = "rollout")]
+            kill_tree: false,
+            #[cfg(feature = "rollout")]
+            max_output_bytes: 1024,
+            #[cfg(feature = "rollout")]
+            json: false,
+            #[cfg(feature = "rollout")]
+            stdin: None,
+            _tty: false,
+            console_socket: None,
+            _pidfd_socket: None,
+            _user: None,
+            cwd: None,
+            env: Vec::new(),
+            _additional_gids: None,
+            _apparmor: None,
+            _cap: Vec::new(),
+            _no_new_privs: false,
+            _preserve_fds: None,
+            id: "id".into(),
+            #[cfg(feature = "rollout")]
+            command: Vec::new(),
+        }));
+        assert!(!command_needs_sealed_reexec(&Cmd::State {
+            id: "id".into()
+        }));
+        assert!(!command_needs_sealed_reexec(&Cmd::Features));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffered_reexec_copy_replaces_partial_memfd_contents() {
+        let src = std::env::temp_dir().join(format!("rsrun-copy-src-{}", std::process::id()));
+        std::fs::write(&src, b"runtime-bytes").unwrap();
+        let mut src_file = std::fs::File::open(&src).unwrap();
+        std::fs::remove_file(&src).unwrap();
+
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"rsrun-test".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            ) as i32
+        };
+        assert!(fd >= 0);
+
+        write_all_raw_fd(fd, b"partial").unwrap();
+        copy_self_exe_to_memfd_buffered(fd, &mut src_file).unwrap();
+
+        assert!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } >= 0);
+        let mut got = [0u8; 32];
+        let n = unsafe { libc::read(fd, got.as_mut_ptr() as *mut _, got.len()) };
+        unsafe { libc::close(fd) };
+        assert_eq!(&got[..n as usize], b"runtime-bytes");
     }
 
     #[test]
