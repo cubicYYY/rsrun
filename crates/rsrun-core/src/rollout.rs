@@ -12,7 +12,7 @@ use crate::state::{write_state, ContainerPaths};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -533,8 +533,18 @@ pub fn cmd_fork(id: &str, new_id: &str, json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn cmd_checkpoint(id: &str, checkpoint_id: &str, json: bool) -> std::io::Result<()> {
+pub fn cmd_checkpoint(
+    id: &str,
+    checkpoint_id: &str,
+    pack: &str,
+    json: bool,
+) -> std::io::Result<()> {
     validate_state_name(checkpoint_id, "checkpoint id")?;
+    if !matches!(pack, "directory" | "overlay2") {
+        return Err(std::io::Error::other(
+            "checkpoint --pack must be directory or overlay2",
+        ));
+    }
     let paths = ContainerPaths::for_id(id);
     ensure_checkpoint_quiescent(id, &paths)?;
     let (overlay, reset_count) = read_overlay_state(&paths)?;
@@ -555,8 +565,20 @@ pub fn cmd_checkpoint(id: &str, checkpoint_id: &str, json: bool) -> std::io::Res
         let _ = std::fs::remove_dir_all(&checkpoint.root);
         return Err(e);
     }
+    let primary_layer = if pack == "overlay2" {
+        install_overlay2_layer(&checkpoint.layer, overlay.lowerdirs.first())?
+    } else {
+        LayerRef {
+            backend: "overlayfs".to_string(),
+            format: "overlay-upperdir".to_string(),
+            store: "local-directory".to_string(),
+            path: checkpoint.layer.clone(),
+            link: None,
+            digest: None,
+        }
+    };
     let mut lowerdirs = Vec::with_capacity(overlay.lowerdirs.len() + 1);
-    lowerdirs.push(checkpoint.layer.clone());
+    lowerdirs.push(resolve_layer_ref(&primary_layer)?);
     lowerdirs.extend(overlay.lowerdirs.iter().cloned());
     let meta = serde_json::json!({
         "version": 1,
@@ -571,12 +593,7 @@ pub fn cmd_checkpoint(id: &str, checkpoint_id: &str, json: bool) -> std::io::Res
         "layer": &checkpoint.layer,
         "lowerdirs": &lowerdirs,
         "parent_lowerdirs": &overlay.lowerdirs,
-        "layers": [{
-            "backend": "overlayfs",
-            "format": "overlay-upperdir",
-            "store": "local-directory",
-            "path": &checkpoint.layer,
-        }],
+        "layers": [layer_ref_json(&primary_layer)],
     });
     std::fs::write(&checkpoint.meta, serde_json::to_vec(&meta)?)?;
     if json {
@@ -589,8 +606,114 @@ pub fn cmd_checkpoint(id: &str, checkpoint_id: &str, json: bool) -> std::io::Res
             "lowerdirs": &lowerdirs,
             "entries": stats.entries,
             "bytes": stats.bytes,
+            "pack": pack,
         });
         println!("{}", serde_json::to_string(&out)?);
+    }
+    Ok(())
+}
+
+pub fn cmd_export_checkpoint(checkpoint_id: &str, format: &str) -> std::io::Result<()> {
+    validate_state_name(checkpoint_id, "checkpoint id")?;
+    if format != "tar" {
+        return Err(std::io::Error::other(
+            "export-checkpoint only supports --format tar for now",
+        ));
+    }
+    let checkpoint = checkpoint_paths(checkpoint_id)?;
+    let meta = read_checkpoint_meta(&checkpoint)?;
+    let tmp = runtime_root_dir()?.join(format!(".export-{checkpoint_id}-{}", std::process::id()));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    let rootfs = tmp.join("rootfs");
+    let result = (|| -> std::io::Result<()> {
+        materialize_lowerdirs(&meta.lowerdirs, &rootfs)?;
+        let manifest = serde_json::json!({
+            "version": 1,
+            "kind": "portable-checkpoint",
+            "backend": "overlayfs",
+            "format": "flattened-rootfs",
+            "id": checkpoint_id,
+            "bundle": meta.bundle,
+            "resetCount": meta.reset_count,
+        });
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        write_checkpoint_artifact_tar(&mut out, &manifest, &rootfs)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+pub fn cmd_import_checkpoint(
+    checkpoint_id: &str,
+    artifact: &Path,
+    json: bool,
+) -> std::io::Result<()> {
+    validate_state_name(checkpoint_id, "checkpoint id")?;
+    let checkpoint = checkpoint_paths(checkpoint_id)?;
+    if checkpoint.root.exists() {
+        return Err(std::io::Error::other(format!(
+            "checkpoint {checkpoint_id} already exists"
+        )));
+    }
+    let tmp = runtime_root_dir()?.join(format!(".import-{checkpoint_id}-{}", std::process::id()));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    std::fs::create_dir_all(&tmp)?;
+    let result = (|| -> std::io::Result<(LayerRef, serde_json::Value)> {
+        let mut input = std::fs::File::open(artifact)?;
+        extract_checkpoint_artifact_tar(&mut input, &tmp)?;
+        let manifest_path = tmp.join(".rsrun/checkpoint.json");
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        if manifest.get("kind").and_then(|v| v.as_str()) != Some("portable-checkpoint") {
+            return Err(std::io::Error::other("artifact is not an rsrun checkpoint"));
+        }
+        let layer = install_overlay2_layer_as(&tmp.join("rootfs"), "flattened-rootfs", None)?;
+        Ok((layer, manifest))
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (layer, manifest) = result?;
+    let lowerdir = resolve_layer_ref(&layer)?;
+    std::fs::create_dir_all(&checkpoint.root)?;
+    let bundle = manifest
+        .get("bundle")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let reset_count = manifest
+        .get("resetCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let meta = serde_json::json!({
+        "version": 1,
+        "kind": "checkpoint",
+        "backend": "overlayfs",
+        "id": checkpoint_id,
+        "source_id": serde_json::Value::Null,
+        "bundle": bundle,
+        "resetCount": reset_count,
+        "entries": serde_json::Value::Null,
+        "bytes": serde_json::Value::Null,
+        "layer": &lowerdir,
+        "lowerdirs": [&lowerdir],
+        "parent_lowerdirs": [],
+        "layers": [layer_ref_json(&layer)],
+        "portable": true,
+    });
+    std::fs::write(&checkpoint.meta, serde_json::to_vec(&meta)?)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "id": checkpoint_id,
+                "imported": true,
+                "backend": "overlayfs",
+                "layer": lowerdir,
+            }))?
+        );
     }
     Ok(())
 }
@@ -667,6 +790,16 @@ struct CheckpointMeta {
     reset_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayerRef {
+    backend: String,
+    format: String,
+    store: String,
+    path: PathBuf,
+    link: Option<String>,
+    digest: Option<String>,
+}
+
 fn snapshot_paths(snapshot_id: &str) -> std::io::Result<SnapshotPaths> {
     let base = runtime_root_dir()?.join(".snapshots").join(snapshot_id);
     Ok(SnapshotPaths {
@@ -692,6 +825,195 @@ fn runtime_root_dir() -> std::io::Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| std::io::Error::other("invalid runtime root"))
+}
+
+fn layer_store_root() -> std::io::Result<PathBuf> {
+    Ok(runtime_root_dir()?.join(".layers"))
+}
+
+fn layer_ref_json(layer: &LayerRef) -> serde_json::Value {
+    serde_json::json!({
+        "backend": layer.backend,
+        "format": layer.format,
+        "store": layer.store,
+        "path": layer.path,
+        "link": layer.link,
+        "digest": layer.digest,
+    })
+}
+
+fn layer_ref_from_json(value: &serde_json::Value) -> std::io::Result<LayerRef> {
+    let string = |key: &str| -> std::io::Result<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| std::io::Error::other(format!("layer metadata missing {key}")))
+    };
+    Ok(LayerRef {
+        backend: string("backend")?,
+        format: string("format")?,
+        store: string("store")?,
+        path: PathBuf::from(string("path")?),
+        link: value
+            .get("link")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        digest: value
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+fn resolve_layer_ref(layer: &LayerRef) -> std::io::Result<PathBuf> {
+    if layer.backend != "overlayfs" {
+        return Err(std::io::Error::other(format!(
+            "unsupported layer backend {}",
+            layer.backend
+        )));
+    }
+    match (layer.format.as_str(), layer.store.as_str()) {
+        ("overlay-upperdir", "local-directory") | ("flattened-rootfs", "local-directory") => {
+            Ok(layer.path.clone())
+        }
+        ("overlay-upperdir", "overlay2-directory") | ("flattened-rootfs", "overlay2-directory") => {
+            if let Some(link) = &layer.link {
+                Ok(layer_store_root()?.join("l").join(link))
+            } else {
+                Ok(layer.path.join("diff"))
+            }
+        }
+        _ => Err(std::io::Error::other(format!(
+            "unsupported layer format/store {}/{}",
+            layer.format, layer.store
+        ))),
+    }
+}
+
+fn install_overlay2_layer(src: &Path, parent_lower: Option<&PathBuf>) -> std::io::Result<LayerRef> {
+    install_overlay2_layer_as(src, "overlay-upperdir", parent_lower)
+}
+
+fn install_overlay2_layer_as(
+    src: &Path,
+    format: &str,
+    parent_lower: Option<&PathBuf>,
+) -> std::io::Result<LayerRef> {
+    let digest = format!("fnv64-{:016x}", digest_tree(src)?);
+    let store = layer_store_root()?;
+    let layers = store.join("layers");
+    let links = store.join("l");
+    std::fs::create_dir_all(&layers)?;
+    std::fs::create_dir_all(&links)?;
+
+    let layer_root = layers.join(&digest);
+    let diff = layer_root.join("diff");
+    if !diff.exists() {
+        let tmp = layers.join(format!(".tmp-{digest}-{}", std::process::id()));
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp)?;
+        }
+        std::fs::create_dir_all(&tmp)?;
+        clone_upperdir(src, &tmp.join("diff"))?;
+        make_tree_readonly(&tmp.join("diff"))?;
+        std::fs::write(tmp.join("link"), short_layer_link(&digest))?;
+        if let Some(parent) = parent_lower {
+            std::fs::write(tmp.join("lower"), parent.as_os_str().as_bytes())?;
+        }
+        std::fs::write(
+            tmp.join("metadata.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "backend": "overlayfs",
+                "format": format,
+                "digest": digest,
+            }))?,
+        )?;
+        std::fs::rename(&tmp, &layer_root)?;
+    }
+
+    let link = short_layer_link(&digest);
+    let link_path = links.join(&link);
+    if !link_path.exists() {
+        std::os::unix::fs::symlink(
+            Path::new("..").join("layers").join(&digest).join("diff"),
+            &link_path,
+        )?;
+    }
+    Ok(LayerRef {
+        backend: "overlayfs".to_string(),
+        format: format.to_string(),
+        store: "overlay2-directory".to_string(),
+        path: layer_root,
+        link: Some(link),
+        digest: Some(digest),
+    })
+}
+
+fn short_layer_link(digest: &str) -> String {
+    digest
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(26)
+        .collect()
+}
+
+fn digest_tree(root: &Path) -> std::io::Result<u64> {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    digest_tree_inner(root, Path::new(""), &mut hash)?;
+    Ok(hash)
+}
+
+fn digest_tree_inner(root: &Path, rel: &Path, hash: &mut u64) -> std::io::Result<()> {
+    let dir = root.join(rel);
+    let mut entries = std::fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let child_rel = rel.join(&name);
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)?;
+        hash_update(hash, slash_path(&child_rel).as_bytes());
+        hash_update(hash, &meta.mode().to_le_bytes());
+        hash_update(hash, &meta.uid().to_le_bytes());
+        hash_update(hash, &meta.gid().to_le_bytes());
+        hash_update(hash, &meta.rdev().to_le_bytes());
+        if meta.file_type().is_file() {
+            hash_update(hash, b"file");
+            let mut file = std::fs::File::open(&child)?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hash_update(hash, &buf[..n]);
+            }
+        } else if meta.file_type().is_dir() {
+            hash_update(hash, b"dir");
+            digest_tree_inner(root, &child_rel, hash)?;
+        } else if meta.file_type().is_symlink() {
+            hash_update(hash, b"symlink");
+            hash_update(hash, std::fs::read_link(&child)?.as_os_str().as_bytes());
+        } else {
+            hash_update(hash, b"special");
+        }
+        for name in list_xattrs(&child)? {
+            hash_update(hash, name.as_bytes());
+            if let Some(value) = lgetxattr_value(&child, &name) {
+                hash_update(hash, &value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_update(hash: &mut u64, bytes: &[u8]) {
+    for b in bytes {
+        *hash ^= *b as u64;
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 fn read_snapshot_meta(paths: &SnapshotPaths) -> std::io::Result<SnapshotMeta> {
@@ -750,17 +1072,39 @@ fn read_checkpoint_meta(paths: &CheckpointPaths) -> std::io::Result<CheckpointMe
     if value.get("backend").and_then(|v| v.as_str()) != Some("overlayfs") {
         return Err(std::io::Error::other("checkpoint backend is not supported"));
     }
-    let lowerdirs = value
-        .get("lowerdirs")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| std::io::Error::other("checkpoint metadata missing lowerdirs"))?
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .map(PathBuf::from)
-                .ok_or_else(|| std::io::Error::other("checkpoint metadata has invalid lowerdirs"))
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let layers = match value.get("layers").and_then(|v| v.as_array()) {
+        Some(values) => values
+            .iter()
+            .map(layer_ref_from_json)
+            .collect::<std::io::Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let lowerdirs = if !layers.is_empty() {
+        let mut resolved = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            resolved.push(resolve_layer_ref(layer)?);
+        }
+        if let Some(values) = value.get("parent_lowerdirs").and_then(|v| v.as_array()) {
+            for lower in values {
+                resolved.push(lower.as_str().map(PathBuf::from).ok_or_else(|| {
+                    std::io::Error::other("checkpoint metadata has invalid parent_lowerdirs")
+                })?);
+            }
+        }
+        resolved
+    } else {
+        value
+            .get("lowerdirs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| std::io::Error::other("checkpoint metadata missing lowerdirs"))?
+            .iter()
+            .map(|v| {
+                v.as_str().map(PathBuf::from).ok_or_else(|| {
+                    std::io::Error::other("checkpoint metadata has invalid lowerdirs")
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?
+    };
     if lowerdirs.is_empty() {
         return Err(std::io::Error::other("checkpoint lowerdir chain is empty"));
     }
@@ -883,6 +1227,120 @@ fn enforce_snapshot_limits(root: &Path) -> std::io::Result<SnapshotStats> {
         )));
     }
     Ok(stats)
+}
+
+fn materialize_lowerdirs(lowerdirs: &[PathBuf], dst: &Path) -> std::io::Result<()> {
+    if dst.exists() {
+        return Err(std::io::Error::other(format!(
+            "materialize destination {} already exists",
+            dst.display()
+        )));
+    }
+    std::fs::create_dir_all(dst)?;
+    for lowerdir in lowerdirs.iter().rev() {
+        apply_layer_to_materialized_root(lowerdir, dst, Path::new(""))?;
+    }
+    make_tree_readonly(dst)
+}
+
+fn apply_layer_to_materialized_root(
+    layer: &Path,
+    dst_root: &Path,
+    rel: &Path,
+) -> std::io::Result<()> {
+    let src_dir = layer.join(rel);
+    let mut entries = std::fs::read_dir(&src_dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let child_rel = rel.join(&name);
+        let src = entry.path();
+        let dst = dst_root.join(&child_rel);
+        let meta = std::fs::symlink_metadata(&src)?;
+        if is_overlay_whiteout(&src, &meta) {
+            let _ = remove_path_any(&dst);
+            continue;
+        }
+        if meta.file_type().is_dir() && is_overlay_opaque_dir(&src) {
+            let _ = remove_dir_contents(&dst);
+        }
+        copy_materialized_path(&src, &dst, &meta)?;
+        if meta.file_type().is_dir() {
+            apply_layer_to_materialized_root(layer, dst_root, &child_rel)?;
+            copy_metadata_without_overlay_xattrs(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_materialized_path(src: &Path, dst: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if meta.file_type().is_dir() {
+        std::fs::create_dir_all(dst)?;
+        copy_metadata_without_overlay_xattrs(src, dst)?;
+    } else {
+        let _ = remove_path_any(dst);
+        if meta.file_type().is_file() {
+            clone_regular_file(src, dst)?;
+            copy_metadata_without_overlay_xattrs(src, dst)?;
+        } else if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(src)?;
+            std::os::unix::fs::symlink(target, dst)?;
+            copy_owner(src, dst, meta)?;
+            copy_xattrs_without_overlay(src, dst)?;
+        } else if meta.file_type().is_fifo()
+            || meta.file_type().is_char_device()
+            || meta.file_type().is_block_device()
+        {
+            clone_special_file(dst, meta)?;
+            copy_metadata_without_overlay_xattrs(src, dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_metadata_without_overlay_xattrs(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    copy_owner(src, dst, &meta)?;
+    copy_xattrs_without_overlay(src, dst)
+}
+
+fn copy_xattrs_without_overlay(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let names = list_xattrs(src)?;
+    for name in names {
+        if name == "trusted.overlay.whiteout" || name == "trusted.overlay.opaque" {
+            continue;
+        }
+        let Some(value) = lgetxattr_value(src, &name) else {
+            continue;
+        };
+        set_xattr(dst, &name, &value)?;
+    }
+    Ok(())
+}
+
+fn remove_dir_contents(path: &Path) -> std::io::Result<()> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        remove_path_any(&entry?.path())?;
+    }
+    Ok(())
+}
+
+fn remove_path_any(path: &Path) -> std::io::Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 fn snapshot_limit_env(name: &str, default: u64) -> u64 {
@@ -1570,6 +2028,125 @@ fn write_overlay_tar<W: Write>(out: &mut W, entries: &[DiffEntry]) -> std::io::R
     Ok(())
 }
 
+fn write_checkpoint_artifact_tar<W: Write>(
+    out: &mut W,
+    manifest: &serde_json::Value,
+    rootfs: &Path,
+) -> std::io::Result<()> {
+    write_tar_header(out, ".rsrun/", 0o755, 0, b'5', None)?;
+    let manifest_bytes = serde_json::to_vec(manifest)?;
+    write_tar_header(
+        out,
+        ".rsrun/checkpoint.json",
+        0o644,
+        manifest_bytes.len() as u64,
+        b'0',
+        None,
+    )?;
+    out.write_all(&manifest_bytes)?;
+    pad_tar(out, manifest_bytes.len() as u64)?;
+    write_tar_header(out, "rootfs/", 0o755, 0, b'5', None)?;
+    write_tree_tar(out, rootfs, Path::new("rootfs"))?;
+    out.write_all(&[0u8; 1024])?;
+    Ok(())
+}
+
+fn write_tree_tar<W: Write>(out: &mut W, root: &Path, rel: &Path) -> std::io::Result<()> {
+    let dir = if rel == Path::new("rootfs") {
+        root.to_path_buf()
+    } else {
+        root.join(rel.strip_prefix("rootfs").unwrap_or(rel))
+    };
+    let mut entries = std::fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let child_rel = rel.join(entry.file_name());
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)?;
+        write_tar_path(out, &slash_path(&child_rel), &child, &meta)?;
+        if meta.file_type().is_dir() {
+            write_tree_tar(out, root, &child_rel)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_checkpoint_artifact_tar<R: Read>(input: &mut R, dst: &Path) -> std::io::Result<()> {
+    loop {
+        let mut header = [0u8; 512];
+        input.read_exact(&mut header)?;
+        if header.iter().all(|b| *b == 0) {
+            let mut second = [0u8; 512];
+            input.read_exact(&mut second)?;
+            break;
+        }
+        let name = tar_header_name(&header)?;
+        let size = parse_tar_octal(&header[124..136])?;
+        let typeflag = header[156];
+        let linkname = tar_header_string(&header[157..257])?;
+        let target = safe_artifact_path(dst, &name)?;
+        match typeflag {
+            b'5' => {
+                std::fs::create_dir_all(&target)?;
+            }
+            b'2' => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = remove_path_any(&target);
+                std::os::unix::fs::symlink(linkname, &target)?;
+            }
+            b'0' | 0 => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&target)?;
+                copy_exact(input, &mut file, size)?;
+                pad_tar_read(input, size)?;
+                continue;
+            }
+            b'3' | b'4' | b'6' => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = remove_path_any(&target);
+                let mode = parse_tar_octal(&header[100..108])? as libc::mode_t;
+                let rdev = if typeflag == b'3' || typeflag == b'4' {
+                    let major = parse_tar_octal(&header[329..337])?;
+                    let minor = parse_tar_octal(&header[337..345])?;
+                    libc::makedev(major as u32, minor as u32)
+                } else {
+                    0
+                };
+                let path_c = CString::new(target.as_os_str().as_bytes())
+                    .map_err(|_| std::io::Error::other("tar path contains NUL"))?;
+                let kind = match typeflag {
+                    b'3' => libc::S_IFCHR,
+                    b'4' => libc::S_IFBLK,
+                    _ => libc::S_IFIFO,
+                } as libc::mode_t;
+                let rc = unsafe { libc::mknod(path_c.as_ptr(), kind | mode, rdev) };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            _ => {
+                skip_exact(input, size)?;
+                pad_tar_read(input, size)?;
+                continue;
+            }
+        }
+        if size > 0 {
+            skip_exact(input, size)?;
+            pad_tar_read(input, size)?;
+        }
+    }
+    Ok(())
+}
+
 fn tar_whiteout_path(path: &str) -> String {
     match path.rsplit_once('/') {
         Some((dir, name)) => format!("{dir}/.wh.{name}"),
@@ -1599,8 +2176,43 @@ fn write_tar_path<W: Write>(
         let mut file = std::fs::File::open(path)?;
         std::io::copy(&mut file, out)?;
         pad_tar(out, meta.len())?;
+    } else if ft.is_char_device() {
+        write_tar_special(out, name, mode, b'3', meta.rdev())?;
+    } else if ft.is_block_device() {
+        write_tar_special(out, name, mode, b'4', meta.rdev())?;
+    } else if ft.is_fifo() {
+        write_tar_special(out, name, mode, b'6', 0)?;
     }
     Ok(())
+}
+
+fn write_tar_special<W: Write>(
+    out: &mut W,
+    name: &str,
+    mode: u32,
+    typeflag: u8,
+    rdev: u64,
+) -> std::io::Result<()> {
+    let mut header = [0u8; 512];
+    write_tar_name(&mut header, name)?;
+    write_octal(&mut header[100..108], mode as u64);
+    write_octal(&mut header[108..116], 0);
+    write_octal(&mut header[116..124], 0);
+    write_octal(&mut header[124..136], 0);
+    write_octal(&mut header[136..148], 0);
+    for b in &mut header[148..156] {
+        *b = b' ';
+    }
+    header[156] = typeflag;
+    write_bytes(&mut header[257..263], b"ustar\0")?;
+    write_bytes(&mut header[263..265], b"00")?;
+    if typeflag == b'3' || typeflag == b'4' {
+        write_octal(&mut header[329..337], libc::major(rdev) as u64);
+        write_octal(&mut header[337..345], libc::minor(rdev) as u64);
+    }
+    let checksum: u32 = header.iter().map(|b| *b as u32).sum();
+    write_octal(&mut header[148..156], checksum as u64);
+    out.write_all(&header)
 }
 
 fn write_tar_empty_file<W: Write>(out: &mut W, name: &str, mode: u32) -> std::io::Result<()> {
@@ -1689,6 +2301,82 @@ fn pad_tar<W: Write>(out: &mut W, size: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+fn pad_tar_read<R: Read>(input: &mut R, size: u64) -> std::io::Result<()> {
+    let pad = (512 - (size % 512)) % 512;
+    if pad > 0 {
+        skip_exact(input, pad)?;
+    }
+    Ok(())
+}
+
+fn copy_exact<R: Read, W: Write>(input: &mut R, out: &mut W, mut size: u64) -> std::io::Result<()> {
+    let mut buf = [0u8; 64 * 1024];
+    while size > 0 {
+        let want = (size as usize).min(buf.len());
+        input.read_exact(&mut buf[..want])?;
+        out.write_all(&buf[..want])?;
+        size -= want as u64;
+    }
+    Ok(())
+}
+
+fn skip_exact<R: Read>(input: &mut R, mut size: u64) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    while size > 0 {
+        let want = (size as usize).min(buf.len());
+        input.read_exact(&mut buf[..want])?;
+        size -= want as u64;
+    }
+    Ok(())
+}
+
+fn parse_tar_octal(bytes: &[u8]) -> std::io::Result<u64> {
+    let s = bytes
+        .iter()
+        .copied()
+        .take_while(|b| *b != 0 && *b != b' ')
+        .filter(|b| *b != 0)
+        .collect::<Vec<_>>();
+    if s.is_empty() {
+        return Ok(0);
+    }
+    let text = std::str::from_utf8(&s).map_err(std::io::Error::other)?;
+    u64::from_str_radix(text.trim(), 8).map_err(std::io::Error::other)
+}
+
+fn tar_header_string(bytes: &[u8]) -> std::io::Result<String> {
+    let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len])
+        .map(str::to_string)
+        .map_err(std::io::Error::other)
+}
+
+fn tar_header_name(header: &[u8; 512]) -> std::io::Result<String> {
+    let name = tar_header_string(&header[0..100])?;
+    let prefix = tar_header_string(&header[345..500])?;
+    if prefix.is_empty() {
+        Ok(name)
+    } else {
+        Ok(format!("{prefix}/{name}"))
+    }
+}
+
+fn safe_artifact_path(root: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(std::io::Error::other("tar entry path is absolute"));
+    }
+    let mut out = root.to_path_buf();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err(std::io::Error::other("tar entry escapes artifact root")),
+        }
+    }
+    Ok(out)
+}
+
 pub fn cmd_reset(id: &str, json: bool) -> std::io::Result<()> {
     let paths = ContainerPaths::for_id(id);
     if !paths.root.exists() {
@@ -1745,6 +2433,9 @@ pub fn cmd_reset(id: &str, json: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod rollout_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_state(name: &str) -> (PathBuf, ContainerPaths) {
         let root = std::env::temp_dir().join(format!(
@@ -1909,6 +2600,77 @@ mod rollout_tests {
             "from-cp2"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overlay2_layer_store_uses_short_resolvable_links() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (root, _paths) = temp_state("overlay2-layer-store");
+        std::env::set_var("RSRUN_ROOT", &root);
+        let layer = root.join("source-layer");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::write(layer.join("file.txt"), b"layer").unwrap();
+
+        let layer_ref = install_overlay2_layer(&layer, None).unwrap();
+        assert_eq!(layer_ref.store, "overlay2-directory");
+        let link = layer_ref.link.as_ref().unwrap();
+        assert!(link.len() <= 26);
+        let resolved = resolve_layer_ref(&layer_ref).unwrap();
+        assert!(resolved.ends_with(link));
+        assert_eq!(
+            std::fs::read_to_string(resolved.join("file.txt")).unwrap(),
+            "layer"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        std::env::remove_var("RSRUN_ROOT");
+    }
+
+    #[test]
+    fn portable_checkpoint_artifact_imports_as_flattened_layer() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (root, _paths) = temp_state("portable-checkpoint");
+        std::env::set_var("RSRUN_ROOT", &root);
+        let base = root.join("base");
+        let delta = root.join("delta");
+        let flattened = root.join("flattened");
+        let imported = root.join("imported");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&delta).unwrap();
+        std::fs::write(base.join("base.txt"), b"base").unwrap();
+        std::fs::write(base.join("shared.txt"), b"base-shared").unwrap();
+        std::fs::write(delta.join("shared.txt"), b"delta-shared").unwrap();
+        std::fs::write(delta.join("new.txt"), b"new").unwrap();
+
+        materialize_lowerdirs(&[delta, base], &flattened).unwrap();
+        let manifest = serde_json::json!({
+            "version": 1,
+            "kind": "portable-checkpoint",
+            "backend": "overlayfs",
+            "format": "flattened-rootfs",
+            "resetCount": 0,
+        });
+        let mut tar = Vec::new();
+        write_checkpoint_artifact_tar(&mut tar, &manifest, &flattened).unwrap();
+        extract_checkpoint_artifact_tar(&mut &tar[..], &imported).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(imported.join("rootfs/base.txt")).unwrap(),
+            "base"
+        );
+        assert_eq!(
+            std::fs::read_to_string(imported.join("rootfs/shared.txt")).unwrap(),
+            "delta-shared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(imported.join("rootfs/new.txt")).unwrap(),
+            "new"
+        );
+        let layer_ref =
+            install_overlay2_layer_as(&imported.join("rootfs"), "flattened-rootfs", None).unwrap();
+        assert_eq!(layer_ref.format, "flattened-rootfs");
+        assert!(resolve_layer_ref(&layer_ref).unwrap().is_dir());
+        let _ = std::fs::remove_dir_all(root);
+        std::env::remove_var("RSRUN_ROOT");
     }
 
     #[test]

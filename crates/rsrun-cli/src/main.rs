@@ -136,8 +136,25 @@ enum Cmd {
     Checkpoint {
         #[arg(long)]
         json: bool,
+        #[arg(long, default_value = "directory")]
+        pack: String,
         id: String,
         checkpoint_id: String,
+    },
+    /// Export a checkpoint as a portable artifact.
+    #[cfg(feature = "rollout")]
+    ExportCheckpoint {
+        #[arg(long, default_value = "tar")]
+        format: String,
+        checkpoint_id: String,
+    },
+    /// Import a portable checkpoint artifact.
+    #[cfg(feature = "rollout")]
+    ImportCheckpoint {
+        #[arg(long)]
+        json: bool,
+        checkpoint_id: String,
+        artifact: PathBuf,
     },
     /// Restore a filesystem snapshot as a new stopped overlayfs-backed state.
     #[cfg(feature = "rollout")]
@@ -347,9 +364,21 @@ fn main() -> ExitCode {
         #[cfg(feature = "rollout")]
         Cmd::Checkpoint {
             json,
+            pack,
             id,
             checkpoint_id,
-        } => runtime::rollout::cmd_checkpoint(&id, &checkpoint_id, json),
+        } => runtime::rollout::cmd_checkpoint(&id, &checkpoint_id, &pack, json),
+        #[cfg(feature = "rollout")]
+        Cmd::ExportCheckpoint {
+            format,
+            checkpoint_id,
+        } => runtime::rollout::cmd_export_checkpoint(&checkpoint_id, &format),
+        #[cfg(feature = "rollout")]
+        Cmd::ImportCheckpoint {
+            json,
+            checkpoint_id,
+            artifact,
+        } => runtime::rollout::cmd_import_checkpoint(&checkpoint_id, &artifact, json),
         #[cfg(feature = "rollout")]
         Cmd::Restore {
             json,

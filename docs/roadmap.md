@@ -236,31 +236,46 @@ These don't affect the bench numbers because none of them touch the
 ### Next Storage Milestone — Local Packed Layers
 
 Goal: close the local layer-format gap without introducing distributed
-storage. `rsrun` should be able to commit checkpoint deltas as immutable
-read-only image files, mount them locally, and compose future branches
-from those mounted roots plus a fresh writable upperdir.
+storage. `rsrun` can now commit checkpoint deltas into a runtime-owned
+overlay2-style local layer store, export a portable flattened
+checkpoint as `tar`, import it on another host, and compose future
+branches from those imported roots plus a fresh writable upperdir.
+Built-in `tar.zst` compression and multi-layer deduplicated artifacts
+remain follow-ups; today callers can compress the exported tar outside
+rsrun.
 
 Proposed commands:
 
 ```text
-rsrun checkpoint <id> <checkpoint-id> --pack directory|image
+rsrun checkpoint <id> <checkpoint-id> --pack directory|overlay2
+rsrun export-checkpoint <checkpoint-id> --format tar > checkpoint.tar
+rsrun import-checkpoint <checkpoint-id> checkpoint.tar
 rsrun fork-checkpoint <checkpoint-id> <new-id>
 rsrun compact-checkpoint <checkpoint-id> <new-checkpoint-id>
 ```
 
 Implementation steps:
 
-1. Add `LayerRef` metadata with `format = overlay-upperdir |
-   readonly-image`, `store = local-directory | local-file`, and a
-   content/path identifier.
-2. Keep `--pack directory` as the current default.
-3. Implement `--pack image` by creating a local immutable image from the
-   checkpoint upperdir and storing it under `.checkpoints/<id>/`.
-4. Add a layer resolver that turns `LayerRef` entries into mounted
-   read-only directories under a runtime-owned mount cache.
-5. Teach `fork-checkpoint` to compose resolved layer mountpoints as
-   lowerdirs and keep each branch upperdir/workdir local and empty.
-6. Add `compact-checkpoint` to materialize a checkpoint chain and pack
+1. ✅ Add `LayerRef` metadata with `format = overlay-upperdir |
+   flattened-rootfs`, `store = local-directory | overlay2-directory`,
+   an optional content digest, and a resolver path.
+2. ✅ Keep `--pack directory` as the current default, and add
+   `--pack overlay2` using a runtime-owned overlay2-style layout: each
+   layer has a `diff/` directory, a `link` file, optional `lower`
+   metadata, and a runtime-owned `l/` directory with short symlinks for
+   lowerdir mount strings. rsrun does not write into Docker's
+   `/var/lib/docker/overlay2`.
+3. ✅ Implement `export-checkpoint` / `import-checkpoint` for portable
+   `tar` artifacts. The first artifact format is flattened and
+   self-contained so it can import on another host without identical
+   absolute base-layer paths.
+4. ✅ Add a layer resolver that turns `LayerRef` entries into local
+   read-only directories or short overlay2 links for `fork-checkpoint`.
+5. Implement built-in `tar.zst` artifacts and stronger content digests
+   once the compression/digest crate boundary is selected.
+6. Implement multi-layer export/import that preserves layer sharing
+   when the destination already has the base layers.
+7. Add `compact-checkpoint` to materialize a checkpoint chain and pack
    it into one new read-only image when lowerdir count or mount-option
    length crosses a configured threshold.
 
@@ -271,8 +286,13 @@ Acceptance criteria:
   upperdir.
 - Deleted paths survive pack, resolve, fork, and compact through the
   same whiteout semantics used by `export-diff`.
+- ✅ A checkpoint exported on one host can be imported on another host and
+  forked without editing metadata by hand.
 - A chain of at least 100 logical checkpoints can be compacted into a
-  bounded number of mounted lower roots before fork.
+  bounded number of mounted lower roots before fork. Keep active
+  overlay lowerdir chains below Docker overlay2's practical 128-layer
+  ceiling and below the mount-option length limit by using short links
+  and compaction.
 - The default OCI lifecycle path does not mount or inspect checkpoint
   layers.
 

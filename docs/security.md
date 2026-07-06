@@ -54,9 +54,29 @@ container's namespaces during `exec`.
 
 [Background — Palo Alto Unit 42 write-up][unit42].
 
-rsrun's defense has three layers.
+rsrun's defense has four layers.
 
-### Layer 1: architectural window
+### Layer 1: sealed memfd self-reexec
+
+Before the vulnerable entry paths (`create` and `exec`) touch
+container-controlled state, rsrun copies its own executable into an
+anonymous `memfd`, seals it with `F_SEAL_WRITE`, `F_SEAL_GROW`,
+`F_SEAL_SHRINK`, and `F_SEAL_SEAL`, then re-execs from that fd with
+`fexecve`.
+
+That means `/proc/<runtime_pid>/exe` points at a sealed anonymous file,
+not the host's on-disk `rsrun` binary. Attempts to overwrite, grow, or
+truncate the backing executable fail. The fast path uses `sendfile` to
+copy `/proc/self/exe` into the memfd; if the kernel rejects `sendfile`,
+rsrun falls back to a bounded buffered copy after truncating and
+rewinding the memfd. Any partial copy failure fails closed before
+`fexecve`.
+
+This mitigation is intentionally scoped to `create` and `exec` so
+benign commands such as `features`, `state`, `start`, and `delete` do
+not pay the extra startup cost.
+
+### Layer 2: architectural window
 
 `cmd_exec` only puts a brief window between `clone` returning in the
 child and the kernel's `execve` succeeding. The parent stays outside
@@ -66,14 +86,14 @@ during the few microseconds of `execve` syscall.
 `create` / `start` / `delete` / `state` / `kill` never enter the
 container's PID namespace at all. They are immune by construction.
 
-### Layer 2: kernel `deny_write_access`
+### Layer 3: kernel `deny_write_access`
 
 Modern Linux kernels (≥ 5.x) call `deny_write_access(file)` at the
 start of `execve`, setting `i_writecount = -1` on the inode. Any
 concurrent `O_WRONLY` open returns `ETXTBSY`. So even if an attacker
 catches the race, the write fails.
 
-### Layer 3: `PR_SET_DUMPABLE`
+### Layer 4: `PR_SET_DUMPABLE`
 
 Before `setns`, rsrun calls `prctl(PR_SET_DUMPABLE, 0)`. The kernel
 then makes `/proc/<pid>/*` files (including the `/proc/<pid>/exe`

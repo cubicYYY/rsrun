@@ -52,7 +52,8 @@ syscall sequence.
   `--preserve-fds`, `--no-pivot`.
 - Overlay-backed agent state primitives: `reset`, `changed-files`,
   `diff`, `export-diff`, `snapshot`, `restore`, `fork`, `checkpoint`,
-  `fork-checkpoint`, `mark`, and `effects`.
+  `export-checkpoint`, `import-checkpoint`, `fork-checkpoint`, `mark`,
+  and `effects`.
 - Passes the [opencontainers/runtime-tools] tests in the
   (`runc` ∩ `crun` ∩ `youki`) intersection.
 - Works under Docker as `--runtime=rsrun`.
@@ -123,7 +124,9 @@ Overlay-backed state commands are intended for rollout
 workflows, not Docker's CRIU checkpoint API:
 
 ```sh
-rsrun checkpoint myid cp1
+rsrun checkpoint myid cp1 --pack overlay2
+rsrun export-checkpoint cp1 --format tar > cp1.tar
+rsrun import-checkpoint cp1-imported cp1.tar
 rsrun fork-checkpoint cp1 branch1 --json
 rsrun mark branch1 step_10
 rsrun effects branch1 --since step_10 --json

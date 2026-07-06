@@ -19,6 +19,33 @@ RSS ~2.2 MB, ~35 % less than crun.
 runs `/bin/true`. `--warmup 30`, `--min-runs 200`. Every iteration
 gets a fresh container ID and a fresh state directory.
 
+### Latest mitigated run (July 6, 2026)
+
+After the CVE-2019-5736 sealed-memfd mitigation was added and optimized
+with `sendfile`, a longer 1000-run lifecycle benchmark still favors
+rsrun over crun:
+
+|         | mean ± σ        | 95 % CI of mean | median  | p10 … p90        | vs rsrun |
+| ------- | --------------: | --------------: | ------: | ---------------: | -------: |
+| **rsrun** | **8.744 ms ± 2.788** | 8.571 … 8.917 ms | 10.052 ms | 4.618 … 10.862 ms | **1.00×** |
+| crun    | 12.903 ms ± 4.620 | 12.616 … 13.189 ms | 15.096 ms | 4.586 … 15.874 ms | 1.476× |
+
+Command:
+
+```sh
+cargo build --release --locked
+hyperfine --warmup 100 --min-runs 1000 --export-json /tmp/rsrun-crun-lifecycle-1000.json ...
+```
+
+The bootstrap 95 % confidence interval for the mean ratio
+`crun / rsrun` is **1.432× … 1.520×**. By means, rsrun is about
+`12.903 / 8.744 = 1.476×` the speed of crun for this lifecycle shape,
+or about **32.2 % lower latency**.
+
+This is still a short-command microbenchmark. The bimodal-looking
+percentiles come from host / VM scheduling effects, so the ratio CI is
+more useful than the raw min/max.
+
 ### Cold cache (drop_caches between runs)
 
 |         | mean ± σ          | min … max          | vs rsrun |
