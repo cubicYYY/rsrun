@@ -107,6 +107,10 @@ short `l/<link>` symlinks) or exported as a portable flattened tar
 artifact and imported on another host. The tar artifact is
 self-contained; built-in compression and multi-layer deduplicated
 artifacts are follow-up storage formats, not hot-path requirements.
+`activate --bundle <bundle> <id>` turns a stopped fork/import state into
+a created container using the prepared overlay rootfs from state and the
+OCI process/mount configuration from the local bundle. After `start`,
+rollout controllers can use `exec --json -- <step>` against that branch.
 `mark` persists a named overlay-diff baseline;
 `effects --since <marker> --json` compares the current diff against
 that baseline and emits changed paths, sensitive touches, and

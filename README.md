@@ -52,8 +52,8 @@ syscall sequence.
   `--preserve-fds`, `--no-pivot`.
 - Overlay-backed agent state primitives: `reset`, `changed-files`,
   `diff`, `export-diff`, `snapshot`, `restore`, `fork`, `checkpoint`,
-  `export-checkpoint`, `import-checkpoint`, `fork-checkpoint`, `mark`,
-  and `effects`.
+  `export-checkpoint`, `import-checkpoint`, `fork-checkpoint`,
+  `activate`, `mark`, and `effects`.
 - Passes the [opencontainers/runtime-tools] tests in the
   (`runc` ∩ `crun` ∩ `youki`) intersection.
 - Works under Docker as `--runtime=rsrun`.
@@ -128,9 +128,16 @@ rsrun checkpoint myid cp1 --pack overlay2
 rsrun export-checkpoint cp1 --format tar > cp1.tar
 rsrun import-checkpoint cp1-imported cp1.tar
 rsrun fork-checkpoint cp1 branch1 --json
+rsrun activate --bundle /path/to/bundle branch1
+rsrun start branch1
+rsrun exec --json branch1 -- sh -c 'echo step'
 rsrun mark branch1 step_10
 rsrun effects branch1 --since step_10 --json
 ```
+
+`activate` turns a stopped fork/import state into a normal created
+container. Pass `--bundle` when the checkpoint artifact was imported on
+a host where the original bundle path is not valid.
 
 As a Docker runtime:
 

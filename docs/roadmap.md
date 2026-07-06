@@ -62,10 +62,13 @@ rollout use. They intentionally sit ahead of broad crun parity.
 - ✅ High-fanout filesystem checkpoints: `checkpoint` freezes the current
   upperdir as a read-only lower layer, while `fork-checkpoint` creates a
   new branch with an empty writable upperdir over the checkpoint chain.
-- Next local-storage gap: pack checkpoint deltas into read-only image
-  layers, resolve/mount those layers as lower roots, and compact long
-  chains. This closes the single-host layer-format gap without adding
-  distributed storage.
+- ✅ Portable local checkpoint layers: checkpoints can be stored in a
+  runtime-owned overlay2-style layer store, exported as a flattened
+  portable tar artifact, imported on another host, and forked without
+  editing absolute metadata paths.
+- ✅ Prepared checkpoint/fork states can be activated into live
+  containers with init/cgroup/namespaces and then used as rollout
+  `exec --json -- <step>` targets.
 - ✅ `mark` and `effects --since <marker> --json` compare current
   overlayfs effects against a named filesystem marker for rollout
   control and debugging.
@@ -81,15 +84,16 @@ state, cheap reset, diff, and export while keeping the lower rootfs as a
 prepared OCI bundle path.
 
 The implementation should keep a small backend boundary around mount,
-diff, export, and cleanup operations so other filesystem strategies can
-be added later. The next storage step is local-only packed read-only
-layers and compaction; distributed backing stores and Docker
-storage-driver integration stay out of scope unless a deployment proves
-rsrun itself must prepare those layers.
+diff, export, import, resolve, and cleanup operations so other
+filesystem strategies can be added later. Storage optimizations such as
+built-in compression, multi-layer deduplicated transfer, erofs, and
+chain compaction stay below the functional parallel-rollout API in
+priority unless a deployment proves storage cost is the blocker.
 
 Build boundary: all rollout-specific filesystem state commands
 (`reset`, `diff`, `export-diff`, `snapshot`, `checkpoint`,
-`fork-checkpoint`, `mark`, `effects`) belong behind `rollout`.
+`export-checkpoint`, `import-checkpoint`, `fork-checkpoint`,
+`activate`, `mark`, `effects`) belong behind `rollout`.
 The OCI lifecycle commands (`create`, `start`, `state`, `kill`,
 `delete`, `exec -p`, `pause`, `resume`, `update`, `stats`, `events`)
 must continue to compile and run without it.
@@ -97,10 +101,11 @@ must continue to compile and run without it.
 ✅ Rollout filesystem/checkpoint implementation lives in
 `rsrun_core::rollout`. `runtime.rs` only calls small rollout hooks
 needed by `create`/`delete`; state operations (`reset`, `diff`,
-`export-diff`, `snapshot`, `checkpoint`, `fork-checkpoint`, `mark`,
-`effects`) stay behind the rollout module boundary. Keep the feature
-flag coarse and avoid spreading per-function cfg logic through the
-lifecycle hot path.
+`export-diff`, `snapshot`, `checkpoint`, `export-checkpoint`,
+`import-checkpoint`, `fork-checkpoint`, `activate`, `mark`, `effects`)
+stay behind the rollout module boundary. Keep the feature flag coarse
+and avoid spreading per-function cfg logic through the lifecycle hot
+path.
 
 ## Production-readiness — what's still missing
 
@@ -223,9 +228,9 @@ These don't affect the bench numbers because none of them touch the
   report post-marker changed paths, sensitive path touches, and
   approximate written bytes. Process, network, and IO accounting remain
   explicit future extensions.
-- Local packed checkpoint layers remain the next filesystem-state step:
-  checkpoint deltas should be packable into immutable read-only images
-  and later resolved into mounted lower roots for `fork-checkpoint`.
+- Local overlay2-style checkpoint layers are implemented for portable
+  filesystem state. More compact read-only image packing is a future
+  storage optimization, not a blocker for the first controller path.
 - `linux.namespaces[].path` — joining a pre-existing namespace via
   `setns(2)`. PID-ns join works (post-clone3 child re-forks once when
   joining `pid`, mirroring crun).
@@ -233,16 +238,19 @@ These don't affect the bench numbers because none of them touch the
   unbindable + `r*` recursive).
 - `linux.sysctl` writes inside the new namespaces.
 
-### Next Storage Milestone — Local Packed Layers
+### Parallel Rollout Minimum
 
-Goal: close the local layer-format gap without introducing distributed
-storage. `rsrun` can now commit checkpoint deltas into a runtime-owned
-overlay2-style local layer store, export a portable flattened
-checkpoint as `tar`, import it on another host, and compose future
-branches from those imported roots plus a fresh writable upperdir.
-Built-in `tar.zst` compression and multi-layer deduplicated artifacts
-remain follow-ups; today callers can compress the exported tar outside
-rsrun.
+Goal: make `rsrun` usable as the low-level controller target for
+parallel rollout. Storage portability is now sufficient for a first
+controller: checkpoints can be written into a runtime-owned
+overlay2-style layer store, exported as a flattened portable tar,
+imported on another host, and forked without editing absolute metadata
+paths.
+
+The remaining work above rsrun is controller policy: deciding when to
+export/import checkpoints, how many branches to fan out, and when to
+delete or retain activated branches. The rsrun-level portable layer use
+path is now available.
 
 Proposed commands:
 
@@ -251,7 +259,7 @@ rsrun checkpoint <id> <checkpoint-id> --pack directory|overlay2
 rsrun export-checkpoint <checkpoint-id> --format tar > checkpoint.tar
 rsrun import-checkpoint <checkpoint-id> checkpoint.tar
 rsrun fork-checkpoint <checkpoint-id> <new-id>
-rsrun compact-checkpoint <checkpoint-id> <new-checkpoint-id>
+rsrun activate <id>
 ```
 
 Implementation steps:
@@ -271,30 +279,55 @@ Implementation steps:
    absolute base-layer paths.
 4. ✅ Add a layer resolver that turns `LayerRef` entries into local
    read-only directories or short overlay2 links for `fork-checkpoint`.
-5. Implement built-in `tar.zst` artifacts and stronger content digests
-   once the compression/digest crate boundary is selected.
-6. Implement multi-layer export/import that preserves layer sharing
-   when the destination already has the base layers.
-7. Add `compact-checkpoint` to materialize a checkpoint chain and pack
-   it into one new read-only image when lowerdir count or mount-option
-   length crosses a configured threshold.
+5. ✅ Add an activation path for prepared states. It should reuse the
+   existing OCI create path as much as possible, but take the already
+   resolved overlay rootfs from state instead of remounting a fresh
+   bundle rootfs. After activation, `state` should report a live init
+   and `exec --json -- <step>` should work.
+6. ✅ Add controller-facing cleanup for activated branches: bounded delete,
+   cgroup cleanup, and overlay unmount must work for imported/forked
+   states exactly like normal `create` states.
 
 Acceptance criteria:
 
-- Branch writes never target packed layers.
+- Branch writes never target read-only checkpoint layers.
 - Reads from older checkpoint layers do not copy data into the branch
   upperdir.
-- Deleted paths survive pack, resolve, fork, and compact through the
+- Deleted paths survive pack, resolve, fork, and import through the
   same whiteout semantics used by `export-diff`.
 - ✅ A checkpoint exported on one host can be imported on another host and
   forked without editing metadata by hand.
-- A chain of at least 100 logical checkpoints can be compacted into a
-  bounded number of mounted lower roots before fork. Keep active
-  overlay lowerdir chains below Docker overlay2's practical 128-layer
-  ceiling and below the mount-option length limit by using short links
-  and compaction.
+- ✅ A branch forked from an imported checkpoint can be activated and used
+  as the target of rollout `exec --json -- <step>` commands.
 - The default OCI lifecycle path does not mount or inspect checkpoint
   layers.
+
+### Future Storage Optimizations
+
+These are useful for scale and cost, but they are not required before
+using rsrun as a basic parallel-rollout runtime target:
+
+- Built-in `tar.zst` artifacts. Today callers can compress the exported
+  tar outside rsrun.
+- Stronger content digests for portable artifacts and layer store
+  entries. The current local store uses a lightweight internal content
+  identifier; external integrity should use a real digest before remote
+  distribution at scale.
+- Multi-layer export/import that preserves layer sharing when the
+  destination already has base layers. Current export is flattened and
+  portable, but not storage-optimal.
+- Packed read-only checkpoint images for immutable checkpoint deltas.
+  The current overlay2-style directory layers are enough for functional
+  branching; image packing should be added when storage density or
+  transfer cost becomes the limiting factor.
+- `compact-checkpoint` to materialize a long checkpoint chain and pack
+  it into one new read-only image when lowerdir count or mount-option
+  length crosses a threshold.
+- erofs or another read-only image backend. The resolver is shaped so
+  this can be wired in later, but overlay2-style directories are enough
+  for the first portable rollout path.
+- Docker storage-driver integration. rsrun should continue to own its
+  layer store rather than writing into Docker's `/var/lib/docker`.
 
 ### Process / security
 - Capabilities (all five sets), rlimits, default `/dev`, masked +

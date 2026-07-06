@@ -221,7 +221,7 @@ pub(crate) fn write_overlay_state(
     std::fs::write(paths.root.join("overlay.json"), serde_json::to_vec(&value)?)
 }
 
-fn read_overlay_state(paths: &ContainerPaths) -> std::io::Result<(OverlayRootfs, u64)> {
+pub(crate) fn read_overlay_state(paths: &ContainerPaths) -> std::io::Result<(OverlayRootfs, u64)> {
     let bytes = std::fs::read(paths.root.join("overlay.json"))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     if value.get("backend").and_then(|v| v.as_str()) != Some("overlayfs") {
@@ -714,6 +714,27 @@ pub fn cmd_import_checkpoint(
                 "layer": lowerdir,
             }))?
         );
+    }
+    Ok(())
+}
+
+pub fn cmd_activate_with_ext(
+    id: &str,
+    bundle: &Path,
+    ext: crate::plan::ExtPlan,
+    json: bool,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    validate_state_name(id, "container id")?;
+    crate::runtime::cmd_activate_prepared_with_ext(id, bundle, ext, timeout_ms)?;
+    if json {
+        let out = serde_json::json!({
+            "id": id,
+            "activated": true,
+            "backend": "overlayfs",
+            "bundle": bundle,
+        });
+        println!("{}", serde_json::to_string(&out)?);
     }
     Ok(())
 }
@@ -2082,12 +2103,14 @@ fn extract_checkpoint_artifact_tar<R: Read>(input: &mut R, dst: &Path) -> std::i
         }
         let name = tar_header_name(&header)?;
         let size = parse_tar_octal(&header[124..136])?;
+        let mode = parse_tar_octal(&header[100..108])? as u32;
         let typeflag = header[156];
         let linkname = tar_header_string(&header[157..257])?;
         let target = safe_artifact_path(dst, &name)?;
         match typeflag {
             b'5' => {
                 std::fs::create_dir_all(&target)?;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
             }
             b'2' => {
                 if let Some(parent) = target.parent() {
@@ -2105,6 +2128,8 @@ fn extract_checkpoint_artifact_tar<R: Read>(input: &mut R, dst: &Path) -> std::i
                     .write(true)
                     .open(&target)?;
                 copy_exact(input, &mut file, size)?;
+                drop(file);
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
                 pad_tar_read(input, size)?;
                 continue;
             }
@@ -2113,7 +2138,6 @@ fn extract_checkpoint_artifact_tar<R: Read>(input: &mut R, dst: &Path) -> std::i
                     std::fs::create_dir_all(parent)?;
                 }
                 let _ = remove_path_any(&target);
-                let mode = parse_tar_octal(&header[100..108])? as libc::mode_t;
                 let rdev = if typeflag == b'3' || typeflag == b'4' {
                     let major = parse_tar_octal(&header[329..337])?;
                     let minor = parse_tar_octal(&header[337..345])?;
@@ -2128,7 +2152,7 @@ fn extract_checkpoint_artifact_tar<R: Read>(input: &mut R, dst: &Path) -> std::i
                     b'4' => libc::S_IFBLK,
                     _ => libc::S_IFIFO,
                 } as libc::mode_t;
-                let rc = unsafe { libc::mknod(path_c.as_ptr(), kind | mode, rdev) };
+                let rc = unsafe { libc::mknod(path_c.as_ptr(), kind | mode as libc::mode_t, rdev) };
                 if rc < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -2640,6 +2664,12 @@ mod rollout_tests {
         std::fs::write(base.join("shared.txt"), b"base-shared").unwrap();
         std::fs::write(delta.join("shared.txt"), b"delta-shared").unwrap();
         std::fs::write(delta.join("new.txt"), b"new").unwrap();
+        std::fs::write(delta.join("tool.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            delta.join("tool.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
 
         materialize_lowerdirs(&[delta, base], &flattened).unwrap();
         let manifest = serde_json::json!({
@@ -2664,6 +2694,13 @@ mod rollout_tests {
         assert_eq!(
             std::fs::read_to_string(imported.join("rootfs/new.txt")).unwrap(),
             "new"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(imported.join("rootfs/tool.sh"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o555
         );
         let layer_ref =
             install_overlay2_layer_as(&imported.join("rootfs"), "flattened-rootfs", None).unwrap();

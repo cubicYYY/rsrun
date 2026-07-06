@@ -334,9 +334,9 @@ echo fork-only | $SUDO tee "$WORK/state.reset/c7/overlay/merged/fork_only" >/dev
 check "fork does not share writable state with source" \
   "$SUDO test -e $WORK/state.reset/c7/overlay/merged/fork_only && $SUDO test ! -e $WORK/state.reset/c5/overlay/merged/fork_only"
 checkpoint_json=$WORK/checkpoint.json
-$SUDO $RUNTIME --root $WORK/state.reset checkpoint --json c5 cp1 > "$checkpoint_json"
-check "checkpoint records immutable lower layer chain" \
-  "python3 -c 'import json,sys; j=json.load(open(\"$checkpoint_json\")); sys.exit(0 if j[\"checkpointed\"] is True and j[\"backend\"] == \"overlayfs\" and len(j[\"lowerdirs\"]) >= 2 else 1)' && $SUDO test -d $WORK/state.reset/.checkpoints/cp1/layer"
+$SUDO $RUNTIME --root $WORK/state.reset checkpoint --json --pack overlay2 c5 cp1 > "$checkpoint_json"
+check "checkpoint records immutable overlay2 lower layer chain" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$checkpoint_json\")); sys.exit(0 if j[\"checkpointed\"] is True and j[\"backend\"] == \"overlayfs\" and j[\"pack\"] == \"overlay2\" and len(j[\"lowerdirs\"]) >= 2 else 1)' && $SUDO test -d $WORK/state.reset/.layers/l"
 fork_cp_a_json=$WORK/fork-checkpoint-a.json
 fork_cp_b_json=$WORK/fork-checkpoint-b.json
 $SUDO $RUNTIME --root $WORK/state.reset fork-checkpoint --json cp1 c8 > "$fork_cp_a_json"
@@ -347,7 +347,7 @@ echo checkpoint-branch | $SUDO tee "$WORK/state.reset/c8/overlay/merged/checkpoi
 check "fork-checkpoint branches do not share writable state" \
   "$SUDO test -e $WORK/state.reset/c8/overlay/merged/checkpoint_branch && $SUDO test ! -e $WORK/state.reset/c9/overlay/merged/checkpoint_branch && $SUDO test ! -e $WORK/state.reset/.checkpoints/cp1/layer/checkpoint_branch"
 checkpoint2_json=$WORK/checkpoint2.json
-$SUDO $RUNTIME --root $WORK/state.reset checkpoint --json c8 cp2 > "$checkpoint2_json"
+$SUDO $RUNTIME --root $WORK/state.reset checkpoint --json --pack overlay2 c8 cp2 > "$checkpoint2_json"
 fork_cp2_json=$WORK/fork-checkpoint-c.json
 $SUDO $RUNTIME --root $WORK/state.reset fork-checkpoint --json cp2 c10 > "$fork_cp2_json"
 check "fork-checkpoint supports multiple lowerdirs" \
@@ -355,11 +355,24 @@ check "fork-checkpoint supports multiple lowerdirs" \
 echo nested-branch | $SUDO tee "$WORK/state.reset/c10/overlay/merged/nested_branch" >/dev/null
 check "multi-lowerdir branch writes stay in newest upper" \
   "$SUDO test -e $WORK/state.reset/c10/overlay/upper/nested_branch && $SUDO test ! -e $WORK/state.reset/.checkpoints/cp2/layer/nested_branch && $SUDO test ! -e $WORK/state.reset/c8/overlay/merged/nested_branch"
+portable_tar=$WORK/portable-cp2.tar
+$SUDO $RUNTIME --root $WORK/state.reset export-checkpoint cp2 > "$portable_tar"
+$SUDO $RUNTIME --root $WORK/state.reset import-checkpoint --json cp2-portable "$portable_tar" > "$WORK/import-checkpoint.json"
+$SUDO $RUNTIME --root $WORK/state.reset fork-checkpoint --json cp2-portable c11 > "$WORK/fork-checkpoint-portable.json"
+write_config activate-portable "" '"/bin/sh", "-c", "sleep 60"'
+$SUDO $RUNTIME --root $WORK/state.reset activate --json --bundle "$BUNDLE" c11 > "$WORK/activate-portable.json"
+check "portable overlay2 checkpoint imports, forks, and activates" \
+  "python3 -c 'import json,sys; i=json.load(open(\"$WORK/import-checkpoint.json\")); f=json.load(open(\"$WORK/fork-checkpoint-portable.json\")); a=json.load(open(\"$WORK/activate-portable.json\")); sys.exit(0 if i[\"imported\"] is True and f[\"forked\"] is True and a[\"activated\"] is True else 1)' && $SUDO $RUNTIME --root $WORK/state.reset state c11 | grep -q '\"status\":\"created\"'"
+$SUDO $RUNTIME --root $WORK/state.reset start c11
+$SUDO $RUNTIME --root $WORK/state.reset exec --json c11 -- sh -c 'test -f /added && test -f /checkpoint_branch && echo portable-branch-ok' > "$WORK/portable-exec.json"
+check "activated portable branch supports rollout exec" \
+  "python3 -c 'import json,sys; j=json.load(open(\"$WORK/portable-exec.json\")); sys.exit(0 if j[\"exit_code\"] == 0 and \"portable-branch-ok\" in j[\"stdout\"] else 1)'"
 $SUDO $RUNTIME --root $WORK/state.reset delete -f c6
 $SUDO $RUNTIME --root $WORK/state.reset delete -f c7
 $SUDO $RUNTIME --root $WORK/state.reset delete -f c8
 $SUDO $RUNTIME --root $WORK/state.reset delete -f c9
 $SUDO $RUNTIME --root $WORK/state.reset delete -f c10
+$SUDO $RUNTIME --root $WORK/state.reset delete -f c11
 reset_json=$WORK/reset.json
 $SUDO $RUNTIME --root $WORK/state.reset reset --json c5 > "$reset_json"
 check "reset reports overlayfs backend" \

@@ -180,6 +180,17 @@ enum Cmd {
         id: String,
         new_id: String,
     },
+    /// Activate a stopped rollout state so it can be started and exec'd.
+    #[cfg(feature = "rollout")]
+    Activate {
+        #[arg(short, long)]
+        bundle: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        timeout: Option<String>,
+        id: String,
+    },
     /// Print the OCI state document for the container.
     State { id: String },
     /// Send a signal to the container init. Defaults to TERM (Docker compat).
@@ -393,6 +404,14 @@ fn main() -> ExitCode {
         } => runtime::rollout::cmd_fork_checkpoint(&checkpoint_id, &new_id, json),
         #[cfg(feature = "rollout")]
         Cmd::Fork { json, id, new_id } => runtime::rollout::cmd_fork(&id, &new_id, json),
+        #[cfg(feature = "rollout")]
+        Cmd::Activate {
+            bundle,
+            json,
+            timeout,
+            id,
+        } => parse_optional_duration_ms(timeout.as_deref())
+            .and_then(|timeout_ms| activate_with_ext(&id, bundle.as_deref(), json, timeout_ms)),
         Cmd::State { id } => runtime::cmd_state(&id),
         Cmd::Kill { id, signal } => runtime::cmd_kill(&id, &signal),
         Cmd::Exec {
@@ -825,8 +844,44 @@ fn create_with_ext(
     )
 }
 
+#[cfg(feature = "rollout")]
+fn activate_with_ext(
+    id: &str,
+    bundle: Option<&std::path::Path>,
+    json: bool,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    let bundle = match bundle {
+        Some(path) => path.canonicalize()?,
+        None => stored_bundle_for_container(id)?.canonicalize()?,
+    };
+    let spec = rsrun_core::spec::Spec::from_bundle(&bundle)?;
+    let ext = rsrun_ext::compile(&spec, id)?;
+    runtime::rollout::cmd_activate_with_ext(id, &bundle, ext, json, timeout_ms)
+}
+
+#[cfg(feature = "rollout")]
+fn stored_bundle_for_container(id: &str) -> std::io::Result<PathBuf> {
+    let paths = rsrun_core::state::ContainerPaths::for_id(id);
+    let bytes = std::fs::read(paths.state_file())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let bundle = value
+        .get("bundle")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::other("activate requires --bundle because stored bundle is empty")
+        })?;
+    Ok(PathBuf::from(bundle))
+}
+
 fn command_needs_sealed_reexec(cmd: &Cmd) -> bool {
-    matches!(cmd, Cmd::Create { .. } | Cmd::Exec { .. })
+    match cmd {
+        Cmd::Create { .. } | Cmd::Exec { .. } => true,
+        #[cfg(feature = "rollout")]
+        Cmd::Activate { .. } => true,
+        _ => false,
+    }
 }
 
 #[cfg(target_os = "linux")]

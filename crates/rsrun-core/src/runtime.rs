@@ -144,12 +144,82 @@ pub fn cmd_create_full_with_timeout(
 ) -> std::io::Result<()> {
     let deadline = Deadline::from_timeout_ms(timeout_ms);
     let bundle = bundle.canonicalize()?;
-    #[cfg(feature = "rollout")]
     let mut spec = Spec::from_bundle(&bundle)?;
-    #[cfg(not(feature = "rollout"))]
-    let spec = Spec::from_bundle(&bundle)?;
     deadline.check("create")?;
+    validate_namespace_paths(&spec)?;
 
+    let paths = ContainerPaths::for_id(id);
+    if paths.root.exists() {
+        return Err(std::io::Error::other(format!(
+            "container {id} already exists"
+        )));
+    }
+    paths.ensure()?;
+
+    spawn_container_init(
+        id,
+        &bundle,
+        &paths,
+        &mut spec,
+        pid_file,
+        ext,
+        console_socket,
+        opts,
+        deadline,
+        RootfsSource::BundleConfigured,
+        true,
+    )
+}
+
+#[cfg(feature = "rollout")]
+pub fn cmd_activate_prepared_with_ext(
+    id: &str,
+    bundle: &Path,
+    ext: crate::plan::ExtPlan,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    let deadline = Deadline::from_timeout_ms(timeout_ms);
+    let bundle = bundle.canonicalize()?;
+    let mut spec = Spec::from_bundle(&bundle)?;
+    deadline.check("activate")?;
+    validate_namespace_paths(&spec)?;
+
+    let paths = ContainerPaths::for_id(id);
+    if !paths.root.exists() {
+        return Err(std::io::Error::other(format!(
+            "container {id} does not exist"
+        )));
+    }
+    let (status, pid, comm) = read_status_pid_comm(&paths);
+    if pid > 0 && is_init_alive(pid, comm.as_deref()) {
+        let st = status.as_deref().unwrap_or("creating");
+        return Err(std::io::Error::other(format!(
+            "cannot activate container {id} in state {st}"
+        )));
+    }
+    if status.as_deref() != Some("stopped") {
+        let st = status.as_deref().unwrap_or("unknown");
+        return Err(std::io::Error::other(format!(
+            "cannot activate container {id} in state {st}"
+        )));
+    }
+    let (overlay, _) = crate::rollout::read_overlay_state(&paths)?;
+    spawn_container_init(
+        id,
+        &bundle,
+        &paths,
+        &mut spec,
+        None,
+        ext,
+        None,
+        crate::plan::CreateOpts::default(),
+        deadline,
+        RootfsSource::PreparedRootfs(overlay.merged),
+        false,
+    )
+}
+
+fn validate_namespace_paths(spec: &Spec) -> std::io::Result<()> {
     // Validate (type, path) pairs for namespace joins before doing any
     // state-dir setup. The OCI spec requires the runtime to MUST error
     // when path's actual namespace type doesn't match the declared type.
@@ -185,28 +255,52 @@ pub fn cmd_create_full_with_timeout(
             )));
         }
     }
+    Ok(())
+}
 
-    let paths = ContainerPaths::for_id(id);
-    if paths.root.exists() {
-        return Err(std::io::Error::other(format!(
-            "container {id} already exists"
-        )));
-    }
-    paths.ensure()?;
+enum RootfsSource {
+    BundleConfigured,
+    #[cfg(feature = "rollout")]
+    PreparedRootfs(PathBuf),
+}
+
+fn spawn_container_init(
+    id: &str,
+    bundle: &Path,
+    paths: &ContainerPaths,
+    spec: &mut Spec,
+    pid_file: Option<&Path>,
+    ext: crate::plan::ExtPlan,
+    console_socket: Option<&Path>,
+    opts: crate::plan::CreateOpts,
+    deadline: Deadline,
+    rootfs_source: RootfsSource,
+    destroy_state_on_error: bool,
+) -> std::io::Result<()> {
+    #[cfg(not(feature = "rollout"))]
+    let _ = &rootfs_source;
 
     let fifo_path = paths.fifo();
+    let _ = std::fs::remove_file(&fifo_path);
     mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)?;
     std::fs::set_permissions(&fifo_path, std::fs::Permissions::from_mode(0o600))?;
 
     #[cfg(feature = "rollout")]
-    let overlay = crate::rollout::prepare_overlay_rootfs(&paths, &spec).map_err(|e| {
-        let _ = cleanup_overlay_rootfs(&paths);
-        let _ = paths.destroy();
-        e
-    })?;
+    let overlay = match rootfs_source {
+        RootfsSource::BundleConfigured => crate::rollout::prepare_overlay_rootfs(paths, spec)
+            .map_err(|e| {
+                cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
+                e
+            })?,
+        RootfsSource::PreparedRootfs(rootfs) => {
+            spec.root_path = rootfs;
+            spec.rootfs_backend = None;
+            None
+        }
+    };
     #[cfg(not(feature = "rollout"))]
     if spec.rootfs_backend.is_some() {
-        let _ = paths.destroy();
+        cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
         return Err(std::io::Error::other(
             "rsrun.rootfs backend support requires the rollout feature",
         ));
@@ -214,15 +308,14 @@ pub fn cmd_create_full_with_timeout(
     #[cfg(feature = "rollout")]
     if let Some(overlay) = overlay.as_ref() {
         spec.root_path = overlay.merged.clone();
-        crate::rollout::write_overlay_state(&paths, overlay, 0).map_err(|e| {
+        crate::rollout::write_overlay_state(paths, overlay, 0).map_err(|e| {
             let _ = crate::rollout::unmount_overlay(overlay);
-            let _ = paths.destroy();
+            cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
             e
         })?;
     }
     let mut plan = CompiledPlan::from_spec(&spec).map_err(|e| {
-        let _ = cleanup_overlay_rootfs(&paths);
-        let _ = paths.destroy();
+        cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
         e
     })?;
     plan.ext = ext;
@@ -234,8 +327,7 @@ pub fn cmd_create_full_with_timeout(
     // Pre-build all CStrings the child needs. Allocator is forbidden after clone3.
     let rootfs_cstr =
         CString::new(plan.root_path.as_os_str().as_encoded_bytes()).map_err(|_| {
-            let _ = cleanup_overlay_rootfs(&paths);
-            let _ = paths.destroy();
+            cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
             std::io::Error::other("rootfs path contains NUL")
         })?;
     let fifo_cstr = CString::new(fifo_path.as_os_str().as_encoded_bytes())
@@ -293,8 +385,7 @@ pub fn cmd_create_full_with_timeout(
             let _ = systemd_create_scope(id, cgroup_dir);
         }
         std::fs::create_dir_all(cgroup_dir).map_err(|e| {
-            let _ = cleanup_overlay_rootfs(&paths);
-            let _ = paths.destroy();
+            cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
             e
         })?;
         for (knob, content) in &plan.ext.cgroup_v2_writes {
@@ -315,8 +406,7 @@ pub fn cmd_create_full_with_timeout(
         // device rules silently dropped is a security regression.
         if !plan.ext.device_cgroup_bpf.is_empty() {
             attach_device_cgroup_bpf(cgroup_dir, &plan.ext.device_cgroup_bpf).map_err(|e| {
-                let _ = cleanup_overlay_rootfs(&paths);
-                let _ = paths.destroy();
+                cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
                 e
             })?;
         }
@@ -328,13 +418,11 @@ pub fn cmd_create_full_with_timeout(
     // namespaces atomically via clone3, the closest equivalent is
     // right before the clone.
     run_hooks(&plan.ext.hooks.create_runtime, id, deadline).map_err(|e| {
-        let _ = cleanup_overlay_rootfs(&paths);
-        let _ = paths.destroy();
+        cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
         e
     })?;
     run_hooks(&plan.ext.hooks.prestart, id, deadline).map_err(|e| {
-        let _ = cleanup_overlay_rootfs(&paths);
-        let _ = paths.destroy();
+        cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
         e
     })?;
     deadline.check("create")?;
@@ -622,11 +710,26 @@ pub fn cmd_create_full_with_timeout(
         // kernel will deliver the exit status here.
         let mut status = 0i32;
         unsafe { libc::waitpid(init_pid, &mut status, 0) };
-        let _ = cleanup_overlay_rootfs(&paths);
-        let _ = paths.destroy();
+        cleanup_failed_spawn(paths, id, bundle, destroy_state_on_error);
         return Err(e);
     }
     Ok(())
+}
+
+fn cleanup_failed_spawn(
+    paths: &ContainerPaths,
+    id: &str,
+    bundle: &Path,
+    destroy_state_on_error: bool,
+) {
+    let _ = std::fs::remove_file(paths.fifo());
+    let _ = std::fs::remove_file(paths.pid_file());
+    if destroy_state_on_error {
+        let _ = cleanup_overlay_rootfs(paths);
+        let _ = paths.destroy();
+    } else {
+        let _ = write_state(paths, id, 0, bundle, "stopped", None);
+    }
 }
 
 /// Load hooks persisted by `cmd_create`. Returns an empty `Hooks` if the
