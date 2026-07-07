@@ -14,14 +14,20 @@ production-ready; some features are not yet thoroughly tested.
 
 ## Performance
 
-On a `create + start + delete` lifecycle (`hyperfine` against an OCI
-bundle running `/bin/true`):
+Recent `hyperfine` run: 1000 warm iterations of
+`create + start + delete` against an OCI bundle running `/bin/true`.
+Lower is better; binaries were run from the VM-local filesystem.
 
-- **Cold cache** (drop_caches between runs): rsrun ~1.4× faster than
-  crun, ~2.4× faster than youki, ~7× faster than runc.
-- **Warm cache**: rsrun and crun are within ~3 %; both ~2.4× faster
-  than youki, ~10× faster than runc.
-- **Max RSS**: 2.2 MB (vs crun 3.4 MB, youki 6.0 MB, runc 11.5 MB).
+| Runtime | Mean | Median | vs rsrun |
+| ------- | ---: | -----: | -------: |
+| **rsrun** | **8.33 ms** | **8.27 ms** | **1.00×** |
+| crun | 10.63 ms | 10.22 ms | 1.28× |
+| youki | 19.60 ms | 17.63 ms | 2.35× |
+| runc | 130.90 ms | 130.06 ms | 15.71× |
+
+This is a tiny-container lifecycle microbenchmark, not a general
+workload benchmark. Short runs have VM scheduling tails, especially for
+crun and youki.
 
 Full numbers, methodology, platform, and reproduce script:
 [docs/benchmarks.md](docs/benchmarks.md).

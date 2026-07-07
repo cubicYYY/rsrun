@@ -9,10 +9,9 @@ is opt-in via its spec field.
 the benchmark host it reduced no lifecycle latency and was slower than
 the default `cgroup.procs` placement path.
 
-**Headline:** rsrun is faster than `crun` when both binaries are run
-from the same VM-local filesystem, ~2.4× faster than `youki`, ~7×
-faster than `runc` in the older full comparison. Max RSS was ~2.2 MB,
-~35 % less than crun.
+**Headline:** in the latest warm lifecycle run, rsrun is ~1.28× faster
+than `crun`, ~2.35× faster than `youki`, and ~15.7× faster than `runc`.
+Max RSS was ~2.2 MB, ~35 % less than crun in the earlier memory run.
 
 ## Lifecycle latency
 
@@ -23,27 +22,29 @@ gets a fresh container ID and a fresh state directory.
 ### Latest mitigated run (July 7, 2026)
 
 After the CVE-2019-5736 mitigation switched to the read-only cloned
-`/proc/self/exe` fd fast path, a 3000-run lifecycle benchmark still
-favors rsrun over crun when both binaries are copied to the VM-local
-filesystem (`/home/yyy.guest/bin`). Running rsrun directly from the
-macOS/Lima shared `/Users/...` path is not comparable because that path
-is `fuseblk` inside the VM.
+`/proc/self/exe` fd fast path, a 1000-run lifecycle benchmark compares
+all four runtimes. `rsrun`, `crun`, and `youki` were run from
+`/home/yyy.guest/bin`; `runc` was `/usr/sbin/runc`, also on the VM
+disk. Running rsrun directly from the macOS/Lima shared `/Users/...`
+path is not comparable because that path is `fuseblk` inside the VM.
 
-|         | mean ± σ        | 95 % CI of mean | median  | p10 … p90        | vs rsrun |
-| ------- | --------------: | --------------: | ------: | ---------------: | -------: |
-| **rsrun** | **8.479 ms ± 1.040** | 8.442 … 8.516 ms | 8.396 ms | n/a | **1.00×** |
-| crun    | 11.268 ms ± 3.785 | 11.133 … 11.403 ms | 10.985 ms | n/a | 1.329× |
+| Runtime | mean ± σ | 95 % CI of mean | median | min … max | vs rsrun |
+| ------- | -------: | --------------: | -----: | --------: | -------: |
+| **rsrun** | **8.333 ms ± 0.791** | 8.284 … 8.382 ms | 8.270 ms | 6.810 … 18.595 ms | **1.00×** |
+| crun | 10.628 ms ± 3.585 | 10.406 … 10.850 ms | 10.220 ms | 6.064 … 42.811 ms | 1.28× |
+| youki | 19.597 ms ± 7.765 | 19.116 … 20.078 ms | 17.626 ms | 11.902 … 130.427 ms | 2.35× |
+| runc | 130.898 ms ± 6.341 | 130.505 … 131.291 ms | 130.056 ms | 117.977 … 240.712 ms | 15.71× |
 
 Command:
 
 ```sh
 cargo build --release --locked
 cp target/release/rsrun /home/yyy.guest/bin/rsrun-local
-hyperfine --warmup 100 --min-runs 3000 --export-json /tmp/rsrun-local-vs-crun-atno-3000.json ...
+hyperfine --warmup 50 --min-runs 1000 --export-json /tmp/rsrun-complete-runtime-comparison-1000.json ...
 ```
 
-By means, crun takes `11.268 / 8.479 = 1.329×` as long as rsrun for
-this lifecycle shape, or rsrun has about **24.8 % lower latency**.
+By means, crun takes `10.628 / 8.333 = 1.28×` as long as rsrun for
+this lifecycle shape, or rsrun has about **21.6 % lower latency**.
 
 `strace` confirmed the protected rsrun path uses one `open_tree`, one
 `mount_setattr(MOUNT_ATTR_RDONLY)`, one fd-based `execveat`, no

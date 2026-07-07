@@ -20,7 +20,8 @@ cd /path/to/rsrun
 cargo build              # debug
 cargo build --release    # release (use this for benches)
 cargo fmt
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 cargo test               # 48 unit tests in <1s
 scripts/smoke.sh                    # M1 lifecycle smoke (10 checks)
 scripts/oci_validation.sh           # OCI runtime-tools (16/16)
@@ -75,8 +76,8 @@ Open an issue with:
 ## Sending patches
 
 - One logical change per pull request.
-- Run `cargo fmt` and `cargo clippy --all-targets -- -D warnings`
-  before pushing.
+- Run `cargo fmt` plus clippy with both `--all-features` and
+  `--no-default-features` before pushing.
 - Include a brief test plan in the PR description: which `rsrun`
   command(s) you ran, and what behavior you observed.
 - For changes to the OCI surface, mention which runtime-tools test
