@@ -2991,6 +2991,7 @@ pub(crate) fn read_status_pid_comm(
     (status, pid, None)
 }
 
+#[cfg(feature = "rollout")]
 pub(crate) fn read_bundle(paths: &ContainerPaths) -> std::io::Result<PathBuf> {
     let bytes = std::fs::read(paths.state_file())?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)?;
