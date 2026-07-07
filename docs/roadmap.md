@@ -197,7 +197,10 @@ clear, we can replace it with something specific:
 ## Now in tree
 
 These don't affect the bench numbers because none of them touch the
-`create + start + delete` hot path of an empty bundle.
+`create + start + delete` hot path of an empty bundle unless their
+corresponding OCI fields or feature flags are enabled. The current
+protected hot path uses a read-only cloned `/proc/self/exe` fd and
+falls back to sealed memfd only on older kernels.
 
 ### Lifecycle / verbs
 - Full `create` / `start` / `delete` / `state` / `kill` / `exec` /

@@ -81,7 +81,7 @@ use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
 use nix::sys::wait::waitpid;
-use nix::unistd::{chdir, execve, execvpe, mkfifo, pivot_root, sethostname, Pid};
+use nix::unistd::{chdir, mkfifo, pivot_root, sethostname, Pid};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -669,6 +669,9 @@ fn spawn_container_init(
     // state.json("created") below, `delete` can still find the orphan
     // init via init.pid and SIGKILL it; without this, a kill-mid-create
     // leaks the init forever.
+    // Internal state metadata: record the basename of argv[0] so state
+    // files keep a human-readable hint for the init command. We do not
+    // rely on it for strict liveness because comm changes during exec.
     let comm_hint = spec
         .args
         .first()
@@ -1738,12 +1741,58 @@ unsafe fn child_run(
         Some(a) => a,
         None => child_die(err_fd, 108, b"empty argv"),
     };
-    if argv0.as_bytes().contains(&b'/') {
-        let _ = execve(argv0, &plan.argv, &plan.envp);
-    } else {
-        let _ = execvpe(argv0, &plan.argv, &plan.envp);
-    }
+    exec_with_env_path(argv0, &plan.argv, &plan.envp);
     child_die(err_fd, 127, b"exec failed");
+}
+
+fn env_path(envp: &[CString]) -> &[u8] {
+    for item in envp {
+        let bytes = item.as_bytes();
+        if let Some(path) = bytes.strip_prefix(b"PATH=") {
+            return path;
+        }
+    }
+    b"/bin:/usr/bin"
+}
+
+fn cstring_ptrs(values: &[CString]) -> Vec<*const libc::c_char> {
+    values
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect()
+}
+
+fn exec_with_env_path(argv0: &CString, argv: &[CString], envp: &[CString]) {
+    let argv_p = cstring_ptrs(argv);
+    let envp_p = cstring_ptrs(envp);
+    unsafe {
+        if argv0.as_bytes().contains(&b'/') {
+            libc::execve(argv0.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
+            return;
+        }
+
+        let mut saw_eacces = false;
+        for dir in env_path(envp).split(|b| *b == b':') {
+            let dir = if dir.is_empty() { b"." } else { dir };
+            let mut candidate = Vec::with_capacity(dir.len() + 1 + argv0.as_bytes().len());
+            candidate.extend_from_slice(dir);
+            candidate.push(b'/');
+            candidate.extend_from_slice(argv0.as_bytes());
+            let Ok(path) = CString::new(candidate) else {
+                continue;
+            };
+            libc::execve(path.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
+            match *libc::__errno_location() {
+                libc::ENOENT | libc::ENOTDIR => {}
+                libc::EACCES => saw_eacces = true,
+                _ => return,
+            }
+        }
+        if saw_eacces {
+            *libc::__errno_location() = libc::EACCES;
+        }
+    }
 }
 
 /// Child-context hook runner. Fork+exec each hook in sequence; on any
@@ -2675,9 +2724,7 @@ pub fn cmd_start_with_timeout(id: &str, timeout_ms: Option<u64>) -> std::io::Res
     drop(f);
     deadline.check("start")?;
 
-    let bundle = read_bundle(&paths)?;
-    let comm_hint = read_comm_hint(&paths);
-    write_state(&paths, id, pid, &bundle, "running", comm_hint.as_deref())?;
+    mark_state_running(&paths, id, pid)?;
 
     // poststart fires after the workload is running. OCI says errors
     // here are logged-and-warning, not fatal.
@@ -2854,9 +2901,9 @@ pub fn cmd_state(id: &str) -> std::io::Result<()> {
     let pid = value.get("pid").and_then(|p| p.as_i64()).unwrap_or(0) as i32;
 
     // Once we've already recorded "stopped" we never go back. Otherwise check
-    // whether the recorded init pid is still alive via /proc/<pid>/comm. We
-    // verify the comm matches the workload's argv[0] basename (recorded at
-    // create time) so a recycled pid for a different process doesn't fool us.
+    // whether the recorded init pid is still alive. `commHint` is preserved as
+    // metadata, but liveness only uses /proc/<pid> because comm transitions
+    // during exec and is not stable enough for a strict check.
     if status != "stopped" && pid > 0 {
         let alive = is_init_alive(pid, value.get("commHint").and_then(|s| s.as_str()));
         if !alive {
@@ -2882,10 +2929,41 @@ pub(crate) fn is_init_alive(pid: i32, _comm_hint: Option<&str>) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
-fn read_comm_hint(paths: &ContainerPaths) -> Option<String> {
-    let bytes = std::fs::read(paths.state_file()).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("commHint").and_then(|s| s.as_str()).map(String::from)
+fn read_bundle_comm_hint(paths: &ContainerPaths) -> std::io::Result<(PathBuf, Option<String>)> {
+    let bytes = std::fs::read(paths.state_file())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let bundle = PathBuf::from(
+        v.get("bundle")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    );
+    let comm = v.get("commHint").and_then(|s| s.as_str()).map(String::from);
+    Ok((bundle, comm))
+}
+
+fn mark_state_running(paths: &ContainerPaths, id: &str, pid: i32) -> std::io::Result<()> {
+    let state_file = paths.state_file();
+    let mut bytes = std::fs::read(&state_file)?;
+    // Normal start path: our writer emits compact JSON and "created" and
+    // "running" have the same length, so this avoids a full JSON parse.
+    if replace_created_status_with_running(&mut bytes) {
+        return std::fs::write(state_file, bytes);
+    }
+    let (bundle, comm_hint) = read_bundle_comm_hint(paths)?;
+    write_state(paths, id, pid, &bundle, "running", comm_hint.as_deref())
+}
+
+fn replace_created_status_with_running(bytes: &mut [u8]) -> bool {
+    const NEEDLE: &[u8] = b"\"status\":\"created\"";
+    const FROM: &[u8] = b"created";
+    const TO: &[u8] = b"running";
+    let Some(pos) = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE) else {
+        return false;
+    };
+    let start = pos + b"\"status\":\"".len();
+    bytes[start..start + FROM.len()].copy_from_slice(TO);
+    true
 }
 
 /// Read `(status, pid, commHint)` from state.json with a fallback to
@@ -3391,21 +3469,7 @@ fn run_exec_process(
             .iter()
             .map(|s| CString::new(s.as_str()).unwrap())
             .collect();
-        let argv_p: Vec<*const libc::c_char> = argv
-            .iter()
-            .map(|c| c.as_ptr())
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
-        let envp_p: Vec<*const libc::c_char> = envp
-            .iter()
-            .map(|c| c.as_ptr())
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
-        if pj.args[0].contains('/') {
-            libc::execve(argv0.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
-        } else {
-            libc::execvpe(argv0.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
-        }
+        exec_with_env_path(&argv0, &argv, &envp);
         libc::_exit(127);
     }
 }
@@ -4198,6 +4262,71 @@ mod runtime_tests {
             Some("delete exceeded timeout")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mark_state_running_rewrites_created_state_without_losing_fields() {
+        let (root, paths) = temp_state("mark-running");
+        crate::state::write_state(
+            &paths,
+            "c",
+            123,
+            Path::new("/bundle with spaces"),
+            "created",
+            Some("true"),
+        )
+        .unwrap();
+
+        mark_state_running(&paths, "c", 123).unwrap();
+
+        let bytes = std::fs::read(paths.state_file()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.get("status").and_then(|v| v.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            value.get("bundle").and_then(|v| v.as_str()),
+            Some("/bundle with spaces")
+        );
+        assert_eq!(value.get("commHint").and_then(|v| v.as_str()), Some("true"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mark_state_running_falls_back_for_unexpected_status_layout() {
+        let (root, paths) = temp_state("mark-running-fallback");
+        std::fs::write(
+            paths.state_file(),
+            br#"{"ociVersion":"1.0.2","id":"c","status":"creating","pid":123,"bundle":"/b","annotations":{},"commHint":"true"}"#,
+        )
+        .unwrap();
+
+        mark_state_running(&paths, "c", 123).unwrap();
+
+        let bytes = std::fs::read(paths.state_file()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.get("status").and_then(|v| v.as_str()),
+            Some("running")
+        );
+        assert_eq!(value.get("bundle").and_then(|v| v.as_str()), Some("/b"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn env_path_uses_container_path_before_default() {
+        let envp = vec![
+            CString::new("HOME=/root").unwrap(),
+            CString::new("PATH=/busybox:/bin").unwrap(),
+        ];
+        assert_eq!(env_path(&envp), b"/busybox:/bin");
+    }
+
+    #[test]
+    fn env_path_defaults_when_missing() {
+        let envp = vec![CString::new("HOME=/root").unwrap()];
+        assert_eq!(env_path(&envp), b"/bin:/usr/bin");
     }
 
     #[test]

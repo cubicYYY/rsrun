@@ -56,21 +56,25 @@ container's namespaces during `exec`.
 
 rsrun's defense has four layers.
 
-### Layer 1: sealed memfd self-reexec
+### Layer 1: protected fd self-reexec
 
 Before the vulnerable entry paths (`create` and `exec`) touch
-container-controlled state, rsrun copies its own executable into an
-anonymous `memfd`, seals it with `F_SEAL_WRITE`, `F_SEAL_GROW`,
-`F_SEAL_SHRINK`, and `F_SEAL_SEAL`, then re-execs from that fd with
-`fexecve`.
+container-controlled state, rsrun re-execs from a protected file
+descriptor rather than from the host's on-disk binary.
 
-That means `/proc/<runtime_pid>/exe` points at a sealed anonymous file,
-not the host's on-disk `rsrun` binary. Attempts to overwrite, grow, or
-truncate the backing executable fail. The fast path uses `sendfile` to
-copy `/proc/self/exe` into the memfd; if the kernel rejects `sendfile`,
-rsrun falls back to a bounded buffered copy after truncating and
-rewinding the memfd. Any partial copy failure fails closed before
-`fexecve`.
+The normal path asks the kernel for a detached clone of
+`/proc/self/exe` with `open_tree(OPEN_TREE_CLONE | AT_NO_AUTOMOUNT)`,
+marks that cloned mount read-only with `mount_setattr(MOUNT_ATTR_RDONLY)`,
+then re-execs from the fd with `fexecve`. This avoids copying the
+binary while still keeping `/proc/<runtime_pid>/exe` away from a
+writable host path.
+
+If the kernel does not support that mount API, rsrun falls back to the
+older sealed-`memfd` path: copy `/proc/self/exe` into an anonymous
+`memfd`, seal it with `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`,
+and `F_SEAL_SEAL`, then `fexecve` from that fd. The memfd copy uses
+`sendfile` first and falls back to a bounded buffered copy only if
+needed. Any partial copy failure fails closed before `fexecve`.
 
 This mitigation is intentionally scoped to `create` and `exec` so
 benign commands such as `features`, `state`, `start`, and `delete` do

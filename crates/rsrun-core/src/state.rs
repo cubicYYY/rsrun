@@ -6,7 +6,6 @@
 //!                                  unblocked when `start` writes to it
 //!   /run/rsrun/<id>/init.pid     — PID of the cloned init process (host PID)
 
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub struct ContainerPaths {
@@ -52,10 +51,11 @@ impl ContainerPaths {
     }
 
     pub fn destroy(&self) -> std::io::Result<()> {
-        if self.root.exists() {
-            std::fs::remove_dir_all(&self.root)?;
+        match std::fs::remove_dir_all(&self.root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 }
 
@@ -67,17 +67,25 @@ pub fn write_state(
     status: &str,
     comm_hint: Option<&str>,
 ) -> std::io::Result<()> {
-    let state = json!({
-        "ociVersion": "1.0.2",
-        "id": id,
-        "status": status,
-        "pid": pid,
-        "bundle": bundle.to_string_lossy(),
-        "annotations": {},
-        // Internal hint used by `state` to detect pid reuse. Not part of OCI.
-        "commHint": comm_hint,
-    });
-    std::fs::write(paths.state_file(), serde_json::to_vec(&state)?)
+    let bundle = bundle.to_string_lossy();
+    let mut out = Vec::with_capacity(
+        96 + id.len() + status.len() + bundle.len() + comm_hint.map(str::len).unwrap_or(4),
+    );
+    out.extend_from_slice(b"{\"ociVersion\":\"1.0.2\",\"id\":");
+    serde_json::to_writer(&mut out, id)?;
+    out.extend_from_slice(b",\"status\":");
+    serde_json::to_writer(&mut out, status)?;
+    out.extend_from_slice(b",\"pid\":");
+    out.extend_from_slice(pid.to_string().as_bytes());
+    out.extend_from_slice(b",\"bundle\":");
+    serde_json::to_writer(&mut out, bundle.as_ref())?;
+    out.extend_from_slice(b",\"annotations\":{},\"commHint\":");
+    match comm_hint {
+        Some(comm) => serde_json::to_writer(&mut out, comm)?,
+        None => out.extend_from_slice(b"null"),
+    }
+    out.push(b'}');
+    std::fs::write(paths.state_file(), out)
 }
 
 pub fn read_pid(paths: &ContainerPaths) -> std::io::Result<i32> {

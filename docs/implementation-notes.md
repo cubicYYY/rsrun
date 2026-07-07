@@ -325,7 +325,7 @@ Everything else from `process.json` was ignored — meaning `docker exec
 ```
 groups → caps (drop bounding, capset) → setresgid → PR_SET_KEEPCAPS →
 setresuid → reapply effective + ambient → noNewPrivs → AppArmor/SELinux
-stage → execvpe
+stage → execve via OCI PATH
 ```
 
 **Code reuse.** The capability and LSM staging functions

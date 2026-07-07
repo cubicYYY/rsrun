@@ -2,7 +2,9 @@
 # Benchmark CVE-2019-5736 mitigation overhead.
 #
 # Compares normal protected `create` startup against the same path with
-# RSRUN_MEMFD_REEXEC=1, which skips only the sealed-memfd self-reexec.
+# RSRUN_MEMFD_REEXEC=1, which skips the protected self-reexec. The
+# normal fast path uses a read-only cloned `/proc/self/exe` fd; older
+# kernels fall back to sealed-memfd self-reexec.
 # This isolates the entry-path cost without requiring root or a valid OCI
 # bundle; both commands intentionally fail after CLI startup.
 set -euo pipefail

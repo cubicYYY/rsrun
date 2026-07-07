@@ -151,7 +151,7 @@ parent                                                child
   │                                                   ├─ seccomp install
   │                                                   ├─ AppArmor/SELinux stage
   │                                                   ├─ startContainer hooks
-  │                                                   └─ execvpe(argv[0], argv, envp)
+  │                                                   └─ execve via OCI PATH
   │
   │ [rootless: write uid_map / gid_map / setgroups; signal sync pipe]
   ├─ write init pid to cgroup.procs unless CLONE_INTO_CGROUP was enabled
@@ -244,7 +244,7 @@ The order rsrun uses, for non-root user:
 8. `capset` again to rebuild `effective` (KEEPCAPS clears it)
 9. `PR_CAP_AMBIENT_RAISE` again (setresuid clears ambient)
 10. `PR_SET_NO_NEW_PRIVS`
-11. `execvpe`
+11. `execve` using the container's OCI `PATH`
 
 For root user (uid 0 → uid 0), steps 5-9 are skipped. `capset` is
 called via direct syscall — no `libcap` dependency.

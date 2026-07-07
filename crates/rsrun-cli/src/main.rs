@@ -891,6 +891,14 @@ fn reexec_from_sealed_memfd() -> std::io::Result<()> {
         return Ok(());
     }
 
+    // Fast path: use a read-only detached clone of /proc/self/exe so the
+    // protected reexec does not copy the runtime binary. Fall back to sealed
+    // memfd on older kernels or filesystems that reject the mount API.
+    match try_readonly_self_exe_fd() {
+        Ok(fd) => return reexec_from_fd(fd, MARKER),
+        Err(_e) => {}
+    }
+
     let fd = unsafe {
         libc::syscall(
             libc::SYS_memfd_create,
@@ -919,6 +927,11 @@ fn reexec_from_sealed_memfd() -> std::io::Result<()> {
         return Err(e);
     }
 
+    reexec_from_fd(fd, MARKER)
+}
+
+#[cfg(target_os = "linux")]
+fn reexec_from_fd(fd: i32, marker: &str) -> std::io::Result<()> {
     let mut argv = Vec::new();
     for arg in std::env::args_os() {
         argv.push(
@@ -929,7 +942,7 @@ fn reexec_from_sealed_memfd() -> std::io::Result<()> {
         );
     }
     let mut envp = Vec::new();
-    envp.push(std::ffi::CString::new(format!("{MARKER}=1")).unwrap());
+    envp.push(std::ffi::CString::new(format!("{marker}=1")).unwrap());
     for (key, value) in std::env::vars_os() {
         let mut item = Vec::new();
         item.extend_from_slice(key.as_os_str().as_bytes());
@@ -958,6 +971,57 @@ fn reexec_from_sealed_memfd() -> std::io::Result<()> {
     let e = std::io::Error::last_os_error();
     unsafe { libc::close(fd) };
     Err(e)
+}
+
+#[cfg(target_os = "linux")]
+fn try_readonly_self_exe_fd() -> std::io::Result<i32> {
+    const OPEN_TREE_CLONE: u32 = 1;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const AT_NO_AUTOMOUNT: u32 = 0x800;
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            c"/proc/self/exe".as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as u32 | AT_NO_AUTOMOUNT,
+        ) as i32
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY,
+        attr_clr: 0,
+        propagation: libc::MS_PRIVATE,
+        userns_fd: 0,
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            fd,
+            c"".as_ptr(),
+            AT_EMPTY_PATH,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
 }
 
 #[cfg(not(target_os = "linux"))]

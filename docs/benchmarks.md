@@ -9,9 +9,10 @@ is opt-in via its spec field.
 the benchmark host it reduced no lifecycle latency and was slower than
 the default `cgroup.procs` placement path.
 
-**Headline:** rsrun is faster than `crun` on cold cache, neck-and-neck
-on warm cache, ~2.4× faster than `youki`, ~7× faster than `runc`. Max
-RSS ~2.2 MB, ~35 % less than crun.
+**Headline:** rsrun is faster than `crun` when both binaries are run
+from the same VM-local filesystem, ~2.4× faster than `youki`, ~7×
+faster than `runc` in the older full comparison. Max RSS was ~2.2 MB,
+~35 % less than crun.
 
 ## Lifecycle latency
 
@@ -19,32 +20,40 @@ RSS ~2.2 MB, ~35 % less than crun.
 runs `/bin/true`. `--warmup 30`, `--min-runs 200`. Every iteration
 gets a fresh container ID and a fresh state directory.
 
-### Latest mitigated run (July 6, 2026)
+### Latest mitigated run (July 7, 2026)
 
-After the CVE-2019-5736 sealed-memfd mitigation was added and optimized
-with `sendfile`, a longer 1000-run lifecycle benchmark still favors
-rsrun over crun:
+After the CVE-2019-5736 mitigation switched to the read-only cloned
+`/proc/self/exe` fd fast path, a 3000-run lifecycle benchmark still
+favors rsrun over crun when both binaries are copied to the VM-local
+filesystem (`/home/yyy.guest/bin`). Running rsrun directly from the
+macOS/Lima shared `/Users/...` path is not comparable because that path
+is `fuseblk` inside the VM.
 
 |         | mean ± σ        | 95 % CI of mean | median  | p10 … p90        | vs rsrun |
 | ------- | --------------: | --------------: | ------: | ---------------: | -------: |
-| **rsrun** | **8.744 ms ± 2.788** | 8.571 … 8.917 ms | 10.052 ms | 4.618 … 10.862 ms | **1.00×** |
-| crun    | 12.903 ms ± 4.620 | 12.616 … 13.189 ms | 15.096 ms | 4.586 … 15.874 ms | 1.476× |
+| **rsrun** | **8.479 ms ± 1.040** | 8.442 … 8.516 ms | 8.396 ms | n/a | **1.00×** |
+| crun    | 11.268 ms ± 3.785 | 11.133 … 11.403 ms | 10.985 ms | n/a | 1.329× |
 
 Command:
 
 ```sh
 cargo build --release --locked
-hyperfine --warmup 100 --min-runs 1000 --export-json /tmp/rsrun-crun-lifecycle-1000.json ...
+cp target/release/rsrun /home/yyy.guest/bin/rsrun-local
+hyperfine --warmup 100 --min-runs 3000 --export-json /tmp/rsrun-local-vs-crun-atno-3000.json ...
 ```
 
-The bootstrap 95 % confidence interval for the mean ratio
-`crun / rsrun` is **1.432× … 1.520×**. By means, rsrun is about
-`12.903 / 8.744 = 1.476×` the speed of crun for this lifecycle shape,
-or about **32.2 % lower latency**.
+By means, crun takes `11.268 / 8.479 = 1.329×` as long as rsrun for
+this lifecycle shape, or rsrun has about **24.8 % lower latency**.
 
-This is still a short-command microbenchmark. The bimodal-looking
-percentiles come from host / VM scheduling effects, so the ratio CI is
-more useful than the raw min/max.
+`strace` confirmed the protected rsrun path uses one `open_tree`, one
+`mount_setattr(MOUNT_ATTR_RDONLY)`, one fd-based `execveat`, no
+`memfd_create`, and no `sendfile`. The workload exec path reaches
+`execve("/bin/true")` in one attempt by searching the OCI `PATH`
+directly.
+
+This is still a short-command microbenchmark. Host / VM scheduling
+effects show up as long tails, so compare runs with the binaries on the
+same filesystem and treat min/max cautiously.
 
 ### Cold cache (drop_caches between runs)
 
