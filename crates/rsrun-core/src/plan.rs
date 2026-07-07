@@ -118,6 +118,7 @@ pub struct MountOp {
     pub target: PathBuf,
     pub fstype: CString,
     pub flags: nix::mount::MsFlags,
+    pub propagation: nix::mount::MsFlags,
     pub data: Option<CString>,
     /// Pre-formatted "0 1000 65536\n..." for `linux.mounts[].uidMappings`.
     /// Empty when this mount is not idmapped — the parent skips spawning
@@ -591,6 +592,7 @@ fn format_id_map(mappings: &[crate::spec::IdMapping]) -> Vec<u8> {
 fn compile_mount(m: &crate::spec::MountSpec, root: &std::path::Path) -> std::io::Result<MountOp> {
     use nix::mount::MsFlags;
     let mut flags = MsFlags::empty();
+    let mut propagation = MsFlags::empty();
     let mut data_parts = Vec::new();
     for opt in &m.options {
         match opt.as_str() {
@@ -604,12 +606,14 @@ fn compile_mount(m: &crate::spec::MountSpec, root: &std::path::Path) -> std::io:
             "strictatime" => flags |= MsFlags::MS_STRICTATIME,
             "bind" => flags |= MsFlags::MS_BIND,
             "rbind" => flags |= MsFlags::MS_BIND | MsFlags::MS_REC,
-            "private" => flags |= MsFlags::MS_PRIVATE,
-            "rprivate" => flags |= MsFlags::MS_PRIVATE | MsFlags::MS_REC,
-            "shared" => flags |= MsFlags::MS_SHARED,
-            "rshared" => flags |= MsFlags::MS_SHARED | MsFlags::MS_REC,
-            "slave" => flags |= MsFlags::MS_SLAVE,
-            "rslave" => flags |= MsFlags::MS_SLAVE | MsFlags::MS_REC,
+            "private" => propagation |= MsFlags::MS_PRIVATE,
+            "rprivate" => propagation |= MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+            "shared" => propagation |= MsFlags::MS_SHARED,
+            "rshared" => propagation |= MsFlags::MS_SHARED | MsFlags::MS_REC,
+            "slave" => propagation |= MsFlags::MS_SLAVE,
+            "rslave" => propagation |= MsFlags::MS_SLAVE | MsFlags::MS_REC,
+            "unbindable" => propagation |= MsFlags::MS_UNBINDABLE,
+            "runbindable" => propagation |= MsFlags::MS_UNBINDABLE | MsFlags::MS_REC,
             other => data_parts.push(other.to_string()),
         }
     }
@@ -631,6 +635,7 @@ fn compile_mount(m: &crate::spec::MountSpec, root: &std::path::Path) -> std::io:
         target,
         fstype: cstr(&m.fstype)?,
         flags,
+        propagation,
         data,
         idmap_uid: format_id_map(&m.uid_mappings),
         idmap_gid: format_id_map(&m.gid_mappings),
@@ -748,6 +753,30 @@ mod tests {
         let plan = CompiledPlan::from_spec(&parse(v)).unwrap();
         assert_eq!(plan.uid_map_data, b"0 1000 1\n");
         assert_eq!(plan.gid_map_data, b"0 1000 1\n");
+    }
+
+    #[test]
+    fn mount_propagation_is_applied_separately_from_mount_creation() {
+        let mut v = minimal_spec();
+        v["mounts"] = json!([
+            {
+                "destination": "/tmp/test-shared",
+                "type": "tmpfs",
+                "source": "tmpfs",
+                "options": ["nosuid", "strictatime", "mode=755", "size=1k", "shared"]
+            }
+        ]);
+
+        let plan = CompiledPlan::from_spec(&parse(v)).unwrap();
+        let mount = &plan.mounts[0];
+        assert!(mount.flags.contains(nix::mount::MsFlags::MS_NOSUID));
+        assert!(mount.flags.contains(nix::mount::MsFlags::MS_STRICTATIME));
+        assert!(!mount.flags.contains(nix::mount::MsFlags::MS_SHARED));
+        assert_eq!(mount.propagation, nix::mount::MsFlags::MS_SHARED);
+        assert_eq!(
+            mount.data.as_ref().unwrap().to_str().unwrap(),
+            "mode=755,size=1k"
+        );
     }
 
     #[test]

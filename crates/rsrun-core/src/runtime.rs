@@ -1346,6 +1346,15 @@ unsafe fn child_run(
             if !apply_idmap_bind(&m.source, &m.target, idmap_userns_fds[idx]) {
                 child_die(err_fd, 130, b"idmapped bind mount failed");
             }
+            if !m.propagation.is_empty() {
+                let _ = mount(
+                    Option::<&str>::None,
+                    &m.target,
+                    Option::<&str>::None,
+                    m.propagation,
+                    Option::<&str>::None,
+                );
+            }
             continue;
         }
 
@@ -1353,6 +1362,14 @@ unsafe fn child_run(
             // Continue on mount failure. Many spec mounts are non-essential
             // (cgroup-inside-container, /dev/mqueue on hosts that don't
             // support it). A future version will surface these as warnings.
+        } else if !m.propagation.is_empty() {
+            let _ = mount(
+                Option::<&str>::None,
+                &m.target,
+                Option::<&str>::None,
+                m.propagation,
+                Option::<&str>::None,
+            );
         }
     }
 
