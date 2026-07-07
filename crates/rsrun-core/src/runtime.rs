@@ -1596,14 +1596,47 @@ unsafe fn child_run(
         let _ = libc::umask(umask);
     }
 
-    // 8b. Apply capability bounding set drops + capset BEFORE user transition,
+    // 8b. no_new_privs (PR_SET_NO_NEW_PRIVS). Strictly honor the spec:
+    // set if-and-only-if `process.noNewPrivileges` is true. When it is
+    // false, Docker's default seccomp profile still needs to be installed
+    // while the init retains CAP_SYS_ADMIN; after the capability drop below,
+    // PR_SET_SECCOMP would fail with EACCES.
+    if plan.no_new_privileges {
+        let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64);
+    }
+
+    // 8c. Install the seccomp filter before dropping capabilities. The
+    // filter is inherited across the later cap/user transition and execve.
+    if !plan.ext.seccomp_bpf.is_empty() {
+        #[repr(C)]
+        struct sock_fprog {
+            len: u16,
+            filter: *const libc::sock_filter,
+        }
+        let fprog = sock_fprog {
+            len: plan.ext.seccomp_bpf.len() as u16,
+            filter: plan.ext.seccomp_bpf.as_ptr(),
+        };
+        let rc = libc::prctl(
+            22,   /* PR_SET_SECCOMP */
+            2u64, /* SECCOMP_MODE_FILTER */
+            &fprog as *const sock_fprog as u64,
+            0u64,
+            0u64,
+        );
+        if rc != 0 {
+            child_die(err_fd, 109, b"prctl PR_SET_SECCOMP failed");
+        }
+    }
+
+    // 8d. Apply capability bounding set drops + capset BEFORE user transition,
     // because PR_CAPBSET_DROP requires effective CAP_SETPCAP, which we have
     // as root but lose after setresuid.
     if let Some(caps) = plan.caps {
         apply_capabilities(err_fd, &caps);
     }
 
-    // 8c. Now transition to non-root user. PR_SET_KEEPCAPS preserves
+    // 8e. Now transition to non-root user. PR_SET_KEEPCAPS preserves
     // permitted across setresuid; we set it right before setresuid.
     if plan.user_gid != 0 && libc::setresgid(plan.user_gid, plan.user_gid, plan.user_gid) < 0 {
         child_die(err_fd, 109, b"setresgid failed");
@@ -1635,43 +1668,11 @@ unsafe fn child_run(
         }
     }
 
-    // 8c. no_new_privs (PR_SET_NO_NEW_PRIVS). Strictly honor the spec:
-    // set if-and-only-if `process.noNewPrivileges` is true. Forcing it
-    // for seccomp would violate the "default" spec (NNP=false) which
-    // ships a no-op SCMP_ACT_ALLOW profile. PR_SET_SECCOMP itself
-    // works without NNP when the caller has CAP_SYS_ADMIN.
-    if plan.no_new_privileges {
-        let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64);
-    }
-
-    // 8d. Install the seccomp filter (must be after caps + NNP, before exec).
-    if !plan.ext.seccomp_bpf.is_empty() {
-        #[repr(C)]
-        struct sock_fprog {
-            len: u16,
-            filter: *const libc::sock_filter,
-        }
-        let fprog = sock_fprog {
-            len: plan.ext.seccomp_bpf.len() as u16,
-            filter: plan.ext.seccomp_bpf.as_ptr(),
-        };
-        let rc = libc::prctl(
-            22,   /* PR_SET_SECCOMP */
-            2u64, /* SECCOMP_MODE_FILTER */
-            &fprog as *const sock_fprog as u64,
-            0u64,
-            0u64,
-        );
-        if rc != 0 {
-            child_die(err_fd, 109, b"prctl PR_SET_SECCOMP failed");
-        }
-    }
-
-    // 8d-tty. PTY: become session leader, claim the pty slave as
+    // 8f-tty. PTY: become session leader, claim the pty slave as
     // controlling tty, dup2 it onto stdin/stdout/stderr. We do this after
-    // user transition + seccomp install so the workload sees the right
-    // owning uid/gid on the tty (per `process.user`). When no PTY was
-    // allocated, pty_slave_fd == -1 and the entire block is a no-op.
+    // user transition so the workload sees the right owning uid/gid on the
+    // tty (per `process.user`). When no PTY was allocated, pty_slave_fd == -1
+    // and the entire block is a no-op.
     if pty_slave_fd >= 0 {
         if libc::setsid() < 0 {
             child_die(err_fd, 116, b"setsid failed");
