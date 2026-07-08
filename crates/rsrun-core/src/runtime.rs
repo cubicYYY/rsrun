@@ -2778,16 +2778,10 @@ pub fn cmd_delete_with_timeout(
             kill_cgroup_procs(id, pid_raw, libc::SIGKILL);
         }
         wait_pid_bounded(pid_raw, deadline)?;
-        for _ in 0..200 {
-            if !std::path::Path::new(&format!("/proc/{}", pid_raw)).exists() {
-                break;
-            }
-            deadline.check("delete").map_err(|e| {
-                let _ = mark_failed(&paths, &e.to_string());
-                e
-            })?;
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        wait_proc_gone_bounded(pid_raw, deadline).map_err(|e| {
+            let _ = mark_failed(&paths, &e.to_string());
+            e
+        })?;
     }
     deadline.check("delete").map_err(|e| {
         let _ = mark_failed(&paths, &e.to_string());
@@ -2832,6 +2826,77 @@ fn wait_pid_bounded(pid_raw: i32, deadline: Deadline) -> std::io::Result<()> {
         deadline.check("delete")?;
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn wait_proc_gone_bounded(pid_raw: i32, deadline: Deadline) -> std::io::Result<()> {
+    if !proc_pid_exists(pid_raw) {
+        return Ok(());
+    }
+    if wait_pidfd_gone(pid_raw, deadline)? {
+        return Ok(());
+    }
+    wait_proc_gone_by_polling(pid_raw, deadline)
+}
+
+fn wait_pidfd_gone(pid_raw: i32, deadline: Deadline) -> std::io::Result<bool> {
+    const SYS_PIDFD_OPEN: libc::c_long = 434;
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid_raw, 0u32) } as i32;
+    if pidfd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let timeout = delete_wait_timeout_ms(deadline)?;
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = loop {
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if r >= 0 {
+            break r;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            unsafe { libc::close(pidfd) };
+            return Err(err);
+        }
+        deadline.check("delete")?;
+    };
+    unsafe { libc::close(pidfd) };
+    if rc == 0 && deadline.expires_at.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "delete exceeded timeout",
+        ));
+    }
+    Ok(rc > 0 || !proc_pid_exists(pid_raw))
+}
+
+fn delete_wait_timeout_ms(deadline: Deadline) -> std::io::Result<i32> {
+    let timeout = match deadline.remaining_ms("delete")? {
+        Some(ms) => ms.min(i32::MAX as u64),
+        None => 1_000,
+    };
+    Ok(i32::try_from(timeout).unwrap_or(i32::MAX))
+}
+
+fn wait_proc_gone_by_polling(pid_raw: i32, deadline: Deadline) -> std::io::Result<()> {
+    for _ in 0..200 {
+        if !proc_pid_exists(pid_raw) {
+            break;
+        }
+        deadline.check("delete")?;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+fn proc_pid_exists(pid_raw: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid_raw}")).exists()
 }
 
 fn kill_cgroup_procs(id: &str, init_pid: i32, signal: i32) {
@@ -4313,6 +4378,42 @@ mod runtime_tests {
         );
         assert_eq!(value.get("bundle").and_then(|v| v.as_str()), Some("/b"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_proc_gone_bounded_observes_exiting_child() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::usleep(20_000);
+                libc::_exit(0);
+            }
+        }
+
+        wait_proc_gone_bounded(pid, Deadline::from_timeout_ms(Some(1_000))).unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    }
+
+    #[test]
+    fn wait_proc_gone_bounded_honors_deadline() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::usleep(500_000);
+                libc::_exit(0);
+            }
+        }
+
+        let err = wait_proc_gone_bounded(pid, Deadline::from_timeout_ms(Some(1))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
     }
 
     #[test]

@@ -56,6 +56,53 @@ This is still a short-command microbenchmark. Host / VM scheduling
 effects show up as long tails, so compare runs with the binaries on the
 same filesystem and treat min/max cautiously.
 
+## Common hot-path profile
+
+Recorded July 8, 2026, on the Lima VM with `target/release/rsrun`
+copied to `/home/yyy.guest/bin/rsrun-hotpath`. Timings run
+`hyperfine` as root so per-command `sudo` overhead is not included.
+Standalone command profiles use a long-lived `sleep` container where
+needed; lifecycle uses a minimal `/bin/true` bundle.
+
+| Hot path | mean ± σ | median | syscall sample |
+| -------- | -------: | -----: | -------------: |
+| `create + start + delete -f` | 5.20 ms ± 2.23 | 4.60 ms | 1,581 |
+| `create` | 3.42 ms ± 0.69 | 3.31 ms | 167 |
+| `start` | 0.54 ms ± 0.27 | 0.47 ms | 84 |
+| `state` on created container | 0.80 ms ± 0.62 | 0.62 ms | 74 |
+| `exec c -- true` | 8.46 ms ± 2.14 | 8.53 ms | 211 |
+| `kill c KILL` | 0.51 ms ± 0.58 | 0.36 ms | 71 |
+| `delete -f` running container | 3.85 ms ± 1.73 | 3.51 ms | 94 |
+
+The syscall sample is one `strace -c` run, so use it for shape rather
+than wall-clock timing. The lifecycle sample is dominated by process
+creation and reaping: `clone3`, `wait4`, `openat`, `mmap`,
+`newfstatat`, and `read`. `exec` is mostly namespace entry and the
+protected re-exec path: `setns`, `open_tree`, `mount_setattr`, and
+`execveat`.
+
+This profile found a real cleanup cost: `delete -f` used to wait for
+`/proc/<pid>` disappearance with fixed 5 ms sleeps, which showed up as
+`clock_nanosleep` in lifecycle traces. The delete path now uses
+`pidfd_open + poll` when available, with the old `/proc` polling loop as
+fallback. In this run, median lifecycle latency dropped from 8.33 ms to
+4.60 ms, and median running-container delete dropped from 6.01 ms to
+3.51 ms. The change does not affect `create`, `start`, or the workload
+exec path.
+
+Reproduce the profile shape:
+
+```sh
+cargo build --release --locked
+cp target/release/rsrun /home/yyy.guest/bin/rsrun-hotpath
+sudo hyperfine --warmup 30 --runs 300 \
+  '/home/yyy.guest/bin/rsrun-hotpath --root /run/rsrun-profile create -b /tmp/rsrun-bench-bundle c'
+sudo strace -f -c -o /tmp/rsrun-hotpath-lifecycle.strace \
+  bash -lc '/home/yyy.guest/bin/rsrun-hotpath --root /run/rsrun-profile create -b /tmp/rsrun-bench-bundle c &&
+            /home/yyy.guest/bin/rsrun-hotpath --root /run/rsrun-profile start c &&
+            /home/yyy.guest/bin/rsrun-hotpath --root /run/rsrun-profile delete -f c'
+```
+
 ### Cold cache (drop_caches between runs)
 
 |         | mean ± σ          | min … max          | vs rsrun |
