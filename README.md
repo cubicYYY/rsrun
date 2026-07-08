@@ -15,15 +15,15 @@ production-ready; some features are not yet thoroughly tested.
 ## Performance
 
 Recent `hyperfine` run: 1000 warm iterations of
-`create + start + delete` against an OCI bundle running `/bin/true`.
+`create + start + delete -f` against an OCI bundle running `/bin/true`.
 Lower is better; binaries were run from the VM-local filesystem.
 
 | Runtime | Mean | Median | vs rsrun |
 | ------- | ---: | -----: | -------: |
-| **rsrun** | **8.33 ms** | **8.27 ms** | **1.00×** |
-| crun | 10.63 ms | 10.22 ms | 1.28× |
-| youki | 19.60 ms | 17.63 ms | 2.35× |
-| runc | 130.90 ms | 130.06 ms | 15.71× |
+| **rsrun** | **5.98 ms** | **5.68 ms** | **1.00×** |
+| crun | 15.69 ms | 15.02 ms | 2.62× |
+| youki | 22.81 ms | 20.17 ms | 3.81× |
+| runc | 138.83 ms | 137.91 ms | 23.21× |
 
 This is a tiny-container lifecycle microbenchmark, not a general
 workload benchmark. Short runs have VM scheduling tails, especially for

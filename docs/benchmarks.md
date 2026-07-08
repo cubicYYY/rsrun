@@ -9,48 +9,51 @@ is opt-in via its spec field.
 the benchmark host it reduced no lifecycle latency and was slower than
 the default `cgroup.procs` placement path.
 
-**Headline:** in the latest warm lifecycle run, rsrun is ~1.28× faster
-than `crun`, ~2.35× faster than `youki`, and ~15.7× faster than `runc`.
+**Headline:** in the latest warm lifecycle run, rsrun is ~2.62× faster
+than `crun`, ~3.81× faster than `youki`, and ~23.2× faster than `runc`.
 Max RSS was ~2.2 MB, ~35 % less than crun in the earlier memory run.
 
 ## Lifecycle latency
 
-`hyperfine` of `create + start + delete` against an OCI bundle that
+`hyperfine` of `create + start + delete -f` against an OCI bundle that
 runs `/bin/true`. `--warmup 30`, `--min-runs 200`. Every iteration
 gets a fresh container ID and a fresh state directory.
 
-### Latest mitigated run (July 7, 2026)
+### Latest mitigated run (July 8, 2026)
 
 After the CVE-2019-5736 mitigation switched to the read-only cloned
-`/proc/self/exe` fd fast path, a 1000-run lifecycle benchmark compares
-all four runtimes. `rsrun`, `crun`, and `youki` were run from
-`/home/yyy.guest/bin`; `runc` was `/usr/sbin/runc`, also on the VM
-disk. Running rsrun directly from the macOS/Lima shared `/Users/...`
+`/proc/self/exe` fd fast path and `delete -f` switched from fixed
+`/proc/<pid>` sleeps to `pidfd_open + poll`, a 1000-run lifecycle
+benchmark compares all four runtimes. `rsrun`, `crun`, and `youki` were
+run from `/home/yyy.guest/bin`; `runc` was `/usr/sbin/runc`, also on the
+VM disk. Running rsrun directly from the macOS/Lima shared `/Users/...`
 path is not comparable because that path is `fuseblk` inside the VM.
 
 | Runtime | mean ± σ | 95 % CI of mean | median | min … max | vs rsrun |
 | ------- | -------: | --------------: | -----: | --------: | -------: |
-| **rsrun** | **8.333 ms ± 0.791** | 8.284 … 8.382 ms | 8.270 ms | 6.810 … 18.595 ms | **1.00×** |
-| crun | 10.628 ms ± 3.585 | 10.406 … 10.850 ms | 10.220 ms | 6.064 … 42.811 ms | 1.28× |
-| youki | 19.597 ms ± 7.765 | 19.116 … 20.078 ms | 17.626 ms | 11.902 … 130.427 ms | 2.35× |
-| runc | 130.898 ms ± 6.341 | 130.505 … 131.291 ms | 130.056 ms | 117.977 … 240.712 ms | 15.71× |
+| **rsrun** | **5.982 ms ± 1.990** | 5.859 … 6.105 ms | 5.683 ms | 3.442 … 31.660 ms | **1.00×** |
+| crun | 15.686 ms ± 5.552 | 15.342 … 16.030 ms | 15.017 ms | 8.054 … 55.059 ms | 2.62× |
+| youki | 22.809 ms ± 10.227 | 22.175 … 23.443 ms | 20.172 ms | 12.803 … 168.545 ms | 3.81× |
+| runc | 138.833 ms ± 8.452 | 138.309 … 139.357 ms | 137.910 ms | 127.151 … 279.220 ms | 23.21× |
 
 Command:
 
 ```sh
 cargo build --release --locked
-cp target/release/rsrun /home/yyy.guest/bin/rsrun-local
-hyperfine --warmup 50 --min-runs 1000 --export-json /tmp/rsrun-complete-runtime-comparison-1000.json ...
+cp target/release/rsrun /home/yyy.guest/bin/rsrun-readme
+hyperfine --warmup 50 --runs 1000 --export-json /tmp/rsrun-readme-runtime-comparison.json ...
 ```
 
-By means, crun takes `10.628 / 8.333 = 1.28×` as long as rsrun for
-this lifecycle shape, or rsrun has about **21.6 % lower latency**.
+By means, crun takes `15.686 / 5.982 = 2.62×` as long as rsrun for
+this lifecycle shape, or rsrun has about **61.9 % lower latency**.
 
 `strace` confirmed the protected rsrun path uses one `open_tree`, one
 `mount_setattr(MOUNT_ATTR_RDONLY)`, one fd-based `execveat`, no
 `memfd_create`, and no `sendfile`. The workload exec path reaches
 `execve("/bin/true")` in one attempt by searching the OCI `PATH`
-directly.
+directly. The latest delete cleanup trace also confirms the fixed sleep
+loop is gone from the fast path: lifecycle cleanup now uses
+`pidfd_open + poll` when the kernel supports pidfds.
 
 This is still a short-command microbenchmark. Host / VM scheduling
 effects show up as long tails, so compare runs with the binaries on the
